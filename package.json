@@ -1,0 +1,16 @@
+{
+  "name": "powerbi-mcp-deployment",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "Miguel Egea Gómez",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "openspec": "^0.0.0"
+  }
+}
