@@ -195,7 +195,7 @@ Necesitas saber qué se desplegó, cuándo y desde qué fichero local, pero no t
 ## 4. Requisitos
 
 - **Sistema operativo**: Windows (el cifrado de tokens usa Windows DPAPI)
-- **Python**: 3.10 o superior
+- **Python**: 3.10 o superior — **no es necesario instalarlo manualmente** si usas [`uv`](https://docs.astral.sh/uv/getting-started/installation/) (ver [Guía de Inicio Rápido](guia-inicio-rapido.md))
 - **Cuenta Power BI**: con permisos mínimos de Visualizador para descargas, Colaborador para publicaciones
 - **Cliente MCP compatible**: GitHub Copilot (VS Code), Claude Desktop, o cualquier cliente MCP
 
@@ -203,8 +203,18 @@ Necesitas saber qué se desplegó, cuándo y desde qué fichero local, pero no t
 
 ## 5. Instalación y Configuración Básica
 
+> **¿Primera vez y sin experiencia técnica?** Sigue la [Guía de Inicio Rápido](guia-inicio-rapido.md), que explica todo el proceso paso a paso sin asumir conocimientos previos de Python.
+
 ### Paso 1: Instalar el servidor
 
+La forma recomendada es usar [`uv`](https://docs.astral.sh/uv/getting-started/installation/), que no requiere instalar Python manualmente ni gestionar entornos virtuales. Una vez instalado `uv`, no hace falta ningún paso adicional: `uvx` descarga y ejecuta el servidor automáticamente la primera vez que el cliente MCP lo invoca.
+
+Alternativamente, instalación clásica con pip:
+```powershell
+pip install powerbi-mcp-deployment
+```
+
+O desde el código fuente (para desarrollo):
 ```powershell
 # Desde el directorio del proyecto
 pip install -r requirements.txt
@@ -213,12 +223,25 @@ pip install -e .
 
 ### Paso 2: Configurar el cliente MCP
 
+**Para Claude Desktop** — añadir a `claude_desktop_config.json` (usando `uvx`, recomendado):
+```json
+{
+  "mcpServers": {
+    "powerbi": {
+      "command": "uvx",
+      "args": ["powerbi-mcp-deployment"]
+    }
+  }
+}
+```
+
 **Para GitHub Copilot (VS Code)** — añadir a `settings.json`:
 ```json
 {
   "github.copilot.chat.mcp.servers": {
     "powerbi": {
-      "command": "powerbi-mcp-deployment",
+      "command": "uvx",
+      "args": ["powerbi-mcp-deployment"],
       "env": {
         "POWERBI_MCP_DB_PATH": "${userHome}/.powerbi-mcp-deployment/metadata.duckdb"
       }
@@ -227,19 +250,7 @@ pip install -e .
 }
 ```
 
-**Para Claude Desktop** — añadir a `claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "powerbi": {
-      "command": "powerbi-mcp-deployment",
-      "env": {
-        "POWERBI_MCP_DB_PATH": "C:\\Users\\TuUsuario\\.powerbi-mcp-deployment\\metadata.duckdb"
-      }
-    }
-  }
-}
-```
+Si instalaste el servidor con `pip` en lugar de usar `uvx`, sustituye `"command": "uvx", "args": ["powerbi-mcp-deployment"]` por `"command": "powerbi-mcp-deployment"` (sin `args`).
 
 ### Paso 3: Primera autenticación
 

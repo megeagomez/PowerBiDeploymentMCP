@@ -2,6 +2,8 @@
 
 A Model Context Protocol (MCP) server for managing Power BI assets including semantic models and reports. Supports all Power BI formats (PBIX, PBIP, PBIR, legacy JSON) with automatic versioning and metadata tracking.
 
+> **¿Eres usuario de Power BI sin experiencia técnica?** Sigue la [Guía de Inicio Rápido](docs/guia-inicio-rapido.md) (en español), que explica cómo instalarlo y usarlo desde Claude Desktop paso a paso.
+
 ## Features
 
 - **Multi-format support**: PBIX, PBIP, PBIR, and legacy JSON report formats
@@ -60,12 +62,22 @@ See [Deployment Configuration Guide](docs/deployment-configuration.md) for detai
 
 ### Prerequisites
 
-- Python 3.10 or higher
-- pip package manager
 - Power BI account with appropriate permissions
 - Windows (for DPAPI token encryption)
 
-### Install from source
+### Recommended: run with `uvx` (no Python setup needed)
+
+If you have [`uv`](https://docs.astral.sh/uv/getting-started/installation/) installed, no manual installation is needed — `uvx` downloads and runs the latest published version automatically. This is the recommended setup for MCP clients like Claude Desktop (see [Configuration](#configuration) below).
+
+If you don't know what `uv` is, see the [Quick Start Guide for Power BI users](docs/guia-inicio-rapido.md) for a non-technical, step-by-step walkthrough.
+
+### Install from PyPI
+
+```powershell
+pip install powerbi-mcp-deployment
+```
+
+### Install from source (for development)
 
 ```powershell
 # Clone the repository
@@ -79,17 +91,24 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-### Install from PyPI (when available)
-
-```powershell
-pip install powerbi-mcp-deployment
-```
-
 ## Configuration
 
 ### MCP Client Setup
 
-Add the Power BI MCP server to your MCP client configuration (e.g., GitHub Copilot):
+Add the Power BI MCP server to your MCP client configuration (e.g., Claude Desktop, GitHub Copilot) using `uvx`:
+
+```json
+{
+  "mcpServers": {
+    "powerbi": {
+      "command": "uvx",
+      "args": ["powerbi-mcp-deployment"]
+    }
+  }
+}
+```
+
+Or, if installed via pip:
 
 ```json
 {

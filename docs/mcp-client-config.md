@@ -29,6 +29,21 @@ Add to `claude_desktop_config.json`:
 {
   "mcpServers": {
     "powerbi": {
+      "command": "uvx",
+      "args": ["powerbi-mcp-deployment"]
+    }
+  }
+}
+```
+
+This requires [`uv`](https://docs.astral.sh/uv/getting-started/installation/) to be installed — `uvx` then downloads and runs the server automatically, with no manual `pip install` step. See the [Quick Start Guide](guia-inicio-rapido.md) for a non-technical walkthrough.
+
+If you installed the package with `pip install powerbi-mcp-deployment` instead, use:
+
+```json
+{
+  "mcpServers": {
+    "powerbi": {
       "command": "powerbi-mcp-deployment",
       "env": {
         "POWERBI_MCP_DB_PATH": "C:\\Users\\YourUser\\.powerbi-mcp-deployment\\metadata.duckdb"
