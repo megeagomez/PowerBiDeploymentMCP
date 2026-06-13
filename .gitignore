@@ -34,3 +34,6 @@ Thumbs.db
 
 # Local runtime data (tokens, metadata DB, logs)
 .powerbi-mcp-deployment/
+
+# OpenSpec working files
+openspec/
