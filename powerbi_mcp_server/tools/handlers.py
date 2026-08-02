@@ -44,13 +44,79 @@ class ToolHandlers:
         await auth.ensure_authenticated()  # raises AuthenticationRequired if no token
 
         if self._client is None:
-            tokens = auth.get_tokens()
-            self._client = PowerBIClient(tokens['powerbi'])
+            # Pass a token *provider* (not a snapshot) so the client keeps
+            # working after the token is refreshed on disk.
+            self._client = PowerBIClient(auth.get_token)
             self._semantic_models = SemanticModelOperations(self._client, self.metadata)
             self._reports = ReportOperations(self._client, self.metadata)
 
         return self._client
-    
+
+    async def _resolve_rebind_model(
+        self,
+        model_workspace_id: str,
+        model_workspace_name: str,
+        model_name: str,
+        source_dir: Optional[Path] = None,
+        user_email: Optional[str] = None,
+    ):
+        """
+        Resolve a rebind target semantic model by name, safely.
+
+        Resolution order:
+          1. Exactly one exact name match -> use it.
+          2. No exact match but a sibling '{model_name}.SemanticModel' folder
+             exists next to source_dir -> deploy that model first and use its
+             new ID (PBIP project with report + model, model not published yet).
+          3. Ambiguous (multiple exact or only partial matches) -> return a
+             needs_disambiguation response instead of guessing.
+          4. Nothing found -> raise.
+
+        Returns:
+            (semantic_model_id, display_name, None) on success, or
+            (None, None, response_dict) when the caller must return that
+            response to the client instead of proceeding.
+        """
+        models = self._client.list_workspace_items(model_workspace_id, 'SemanticModel')
+        exact = [m for m in models if m['displayName'] == model_name]
+        if len(exact) == 1:
+            return exact[0]['id'], exact[0]['displayName'], None
+
+        # Model not published yet: deploy the local sibling model first
+        if not exact and source_dir is not None:
+            sibling = source_dir.parent / f"{model_name}.SemanticModel"
+            if sibling.is_dir():
+                logger.info(
+                    f"Rebind target '{model_name}' not found in workspace; "
+                    f"deploying sibling model from {sibling} first"
+                )
+                deploy_result = await self._semantic_models.upload_pbip(
+                    workspace_id=model_workspace_id,
+                    workspace_name=model_workspace_name,
+                    directory_path=sibling,
+                    dataset_name=model_name,
+                    user_email=user_email,
+                )
+                return deploy_result['dataset_id'], model_name, None
+
+        partial = [m for m in models if model_name.lower() in m['displayName'].lower()]
+        candidates = exact if len(exact) > 1 else partial
+        if candidates:
+            return None, None, {
+                'success': False,
+                'needs_disambiguation': True,
+                'message': f"Hay varios modelos que coinciden con '{model_name}' en "
+                           f"'{model_workspace_name}'. Indica el nombre exacto y reintenta.",
+                'candidates': [
+                    {'id': m['id'], 'displayName': m['displayName']} for m in candidates
+                ],
+            }
+
+        raise ValueError(
+            f"Modelo semántico no encontrado para reenlace: {model_name} "
+            f"(workspace: {model_workspace_name})"
+        )
+
     async def list_workspaces(self, arguments: Dict[str, Any]) -> List[Dict]:
         """List all accessible workspaces"""
         client = await self._ensure_authenticated()
@@ -110,34 +176,29 @@ class ToolHandlers:
             raise ValueError(f"Modelo semántico no encontrado: {dataset_name}")
         
         dataset_id = dataset['id']
-        
-        # Auto-detect format if not specified
-        if format is None:
-            format = self._semantic_models.detect_format(target_path) or 'pbix'
-        
+
+        # PBIX download is not supported: the Power BI REST API has no
+        # dataset-level export endpoint. Models download as PBIP.
+        if format == 'pbix':
+            return {
+                'success': False,
+                'error': "La descarga de modelos en PBIX no está soportada por la API de Power BI "
+                         "(el export PBIX es solo de informes). Usa el formato 'pbip'."
+            }
+
         # Download
         auth = get_authenticator()
-        user_info = auth.get_user_info()
-        
-        if format == 'pbix':
-            result = await self._semantic_models.download_pbix(
-                workspace_id=workspace_id,
-                workspace_name=workspace_name,
-                dataset_id=dataset_id,
-                dataset_name=dataset_name,
-                target_path=target_path,
-                user_email=user_info.get('email')
-            )
-        else:  # pbip
-            result = await self._semantic_models.download_pbip(
-                workspace_id=workspace_id,
-                workspace_name=workspace_name,
-                dataset_id=dataset_id,
-                dataset_name=dataset_name,
-                target_dir=target_path,
-                user_email=user_info.get('email')
-            )
-        
+        user_info = auth.get_user_info() or {}
+
+        result = await self._semantic_models.download_pbip(
+            workspace_id=workspace_id,
+            workspace_name=workspace_name,
+            dataset_id=dataset_id,
+            dataset_name=dataset_name,
+            target_dir=target_path,
+            user_email=user_info.get('user_email')
+        )
+
         return result
     
     async def upload_semantic_model(self, arguments: Dict[str, Any]) -> Dict:
@@ -162,7 +223,7 @@ class ToolHandlers:
         
         # Upload
         auth = get_authenticator()
-        user_info = auth.get_user_info()
+        user_info = auth.get_user_info() or {}
         
         if format == 'pbix':
             result = await self._semantic_models.upload_pbix(
@@ -170,7 +231,7 @@ class ToolHandlers:
                 workspace_name=workspace_name,
                 file_path=source_path,
                 dataset_name=dataset_name,
-                user_email=user_info.get('email')
+                user_email=user_info.get('user_email')
             )
         else:  # pbip
             result = await self._semantic_models.upload_pbip(
@@ -178,7 +239,7 @@ class ToolHandlers:
                 workspace_name=workspace_name,
                 directory_path=source_path,
                 dataset_name=dataset_name,
-                user_email=user_info.get('email')
+                user_email=user_info.get('user_email')
             )
         
         return result
@@ -208,7 +269,7 @@ class ToolHandlers:
         
         # Download
         auth = get_authenticator()
-        user_info = auth.get_user_info()
+        user_info = auth.get_user_info() or {}
         
         result = await self._reports.download_pbir(
             workspace_id=workspace_id,
@@ -216,7 +277,7 @@ class ToolHandlers:
             report_id=report_id,
             report_name=report_name,
             target_dir=target_path,
-            user_email=user_info.get('email')
+            user_email=user_info.get('user_email')
         )
         
         return result
@@ -238,34 +299,45 @@ class ToolHandlers:
 
         workspace_id = workspace['id']
 
-        # Find semantic model if rebinding (optionally in a different workspace)
+        auth = get_authenticator()
+        user_info = auth.get_user_info() or {}
+
+        # Find semantic model if rebinding (optionally in a different workspace).
+        # If the model isn't published yet but its .SemanticModel folder sits
+        # next to the report folder (PBIP project), it gets deployed first.
         semantic_model_id = None
+        model_workspace_id = None
         if rebind_to_model:
             model_workspace_id = workspace_id
+            model_workspace_name = workspace_name
             if rebind_workspace_name:
                 model_workspace = self._client.get_workspace_by_name(rebind_workspace_name)
                 if not model_workspace:
                     raise ValueError(f"Workspace no encontrado: {rebind_workspace_name}")
                 model_workspace_id = model_workspace['id']
+                model_workspace_name = rebind_workspace_name
 
-            models = self._reports.find_semantic_models_by_name(model_workspace_id, rebind_to_model)
-            if not models:
-                raise ValueError(f"Modelo semántico no encontrado para reenlace: {rebind_to_model}")
-            semantic_model_id = models[0]['id']
-        
+            semantic_model_id, _, pending = await self._resolve_rebind_model(
+                model_workspace_id=model_workspace_id,
+                model_workspace_name=model_workspace_name,
+                model_name=rebind_to_model,
+                source_dir=source_path,
+                user_email=user_info.get('user_email'),
+            )
+            if pending:
+                return pending
+
         # Upload
-        auth = get_authenticator()
-        user_info = auth.get_user_info()
-        
         result = await self._reports.upload_pbir(
             workspace_id=workspace_id,
             workspace_name=workspace_name,
             directory_path=source_path,
             report_name=report_name,
             semantic_model_id=semantic_model_id,
-            user_email=user_info.get('email')
+            semantic_model_workspace_id=model_workspace_id,
+            user_email=user_info.get('user_email')
         )
-        
+
         return result
 
     async def rebind_report(self, arguments: Dict[str, Any]) -> Dict:
@@ -294,14 +366,16 @@ class ToolHandlers:
                 raise ValueError(f"Workspace no encontrado: {target_model_workspace_name}")
             model_workspace_id = model_workspace['id']
 
-        models = self._reports.find_semantic_models_by_name(model_workspace_id, target_model_name)
-        if not models:
-            raise ValueError(f"Modelo semántico no encontrado para reenlace: {target_model_name}")
-        semantic_model_id = models[0]['id']
-        semantic_model_name = models[0]['displayName']
+        semantic_model_id, semantic_model_name, pending = await self._resolve_rebind_model(
+            model_workspace_id=model_workspace_id,
+            model_workspace_name=target_model_workspace_name,
+            model_name=target_model_name,
+        )
+        if pending:
+            return pending
 
         auth = get_authenticator()
-        user_info = auth.get_user_info()
+        user_info = auth.get_user_info() or {}
 
         result = await self._reports.rebind_report(
             workspace_id=workspace_id,
@@ -310,7 +384,7 @@ class ToolHandlers:
             semantic_model_id=semantic_model_id,
             semantic_model_name=semantic_model_name,
             semantic_model_workspace_name=target_model_workspace_name,
-            user_email=user_info.get('email')
+            user_email=user_info.get('user_email')
         )
 
         return result
@@ -332,8 +406,8 @@ class ToolHandlers:
         destination_path.mkdir(parents=True, exist_ok=True)
 
         auth = get_authenticator()
-        user_info = auth.get_user_info()
-        user_email = user_info.get('email')
+        user_info = auth.get_user_info() or {}
+        user_email = user_info.get('user_email')
 
         results = {'workspace': workspace_name, 'destination': str(destination_path),
                    'semantic_models': [], 'reports': [], 'errors': []}

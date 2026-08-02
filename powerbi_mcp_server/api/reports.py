@@ -7,6 +7,7 @@ Handles download and upload of reports in all formats (PBIR, legacy JSON).
 import base64
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -53,6 +54,17 @@ class ReportOperations:
 
         # Build proper .Report folder (PBI Desktop convention)
         report_dir = target_dir / f"{report_name}.Report"
+
+        # Versioning: outside a Git repo, keep a timestamped copy of a previous
+        # download instead of silently overwriting it (inside Git, history
+        # already protects the previous version).
+        version_suffix = None
+        if report_dir.is_dir() and any(report_dir.iterdir()) and not self.metadata.is_git_controlled(target_dir):
+            version_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_dir = target_dir / f"{report_name}_{version_suffix}.Report"
+            report_dir.rename(backup_dir)
+            logger.info(f"Preserved previous download as: {backup_dir.name}")
+
         report_dir.mkdir(parents=True, exist_ok=True)
 
         # Save each part
@@ -93,7 +105,7 @@ class ReportOperations:
             workspace_id=workspace_id,
             workspace_name=workspace_name,
             local_file_path=report_dir,
-            version_suffix=None,
+            version_suffix=version_suffix,
             user_email=user_email
         )
 
@@ -105,9 +117,36 @@ class ReportOperations:
             'pbip_path': str(pbip_path),
             'format': 'pbir',
             'parts_count': len(parts),
+            'versioned': version_suffix is not None,
+            'version_suffix': version_suffix,
             'download_id': download_id
         }
     
+    @staticmethod
+    def _patch_definition_pbir(content: bytes, semantic_model_id: str) -> bytes:
+        """
+        Rewrite the datasetReference of a definition.pbir to point at a
+        published semantic model by ID (byConnection).
+
+        PBIP projects reference their model by relative path (byPath), which
+        only resolves when report and model are uploaded together to the same
+        workspace. byConnection binds the report to the model's ID instead, so
+        the report and its model can live in different workspaces (same
+        pattern Microsoft's fabric-cicd uses).
+        """
+        pbir = json.loads(content)
+        pbir['datasetReference'] = {
+            'byConnection': {
+                'connectionString': None,
+                'pbiServiceModelId': None,
+                'pbiModelVirtualServerName': 'sobe_wowvirtualserver',
+                'pbiModelDatabaseName': semantic_model_id,
+                'name': 'EntityDataSource',
+                'connectionType': 'pbiServiceXmlaStyleLive',
+            }
+        }
+        return json.dumps(pbir, indent=2).encode('utf-8')
+
     async def upload_pbir(
         self,
         workspace_id: str,
@@ -115,14 +154,19 @@ class ReportOperations:
         directory_path: Path,
         report_name: Optional[str] = None,
         semantic_model_id: Optional[str] = None,
+        semantic_model_workspace_id: Optional[str] = None,
         user_email: Optional[str] = None
     ) -> Dict:
         """
         Upload report in PBIR format (Power BI Report)
-        
+
         Args:
-            semantic_model_id: Optional ID to rebind report to different model
-            
+            semantic_model_id: Optional ID to rebind report to different model.
+                Patches definition.pbir (byPath -> byConnection) so the model
+                can live in a different workspace than the report.
+            semantic_model_workspace_id: Workspace where the rebind model lives
+                (defaults to the report's workspace; used for metadata tracking)
+
         Returns:
             Dict with upload result including asset ID
         """
@@ -148,12 +192,17 @@ class ReportOperations:
                 continue
             content = file_path.read_bytes()
 
-            # Handle rebinding if semantic_model_id provided and this is report.json
+            # Handle rebinding: definition.pbir is where the model binding
+            # lives in modern PBIR projects (byPath/byConnection)
+            if semantic_model_id and str(relative_path).replace('\\', '/') == 'definition.pbir':
+                content = self._patch_definition_pbir(content, semantic_model_id)
+
+            # Legacy reports keep the binding as datasetId inside report.json
             if semantic_model_id and relative_path.name == 'report.json':
                 report_json = json.loads(content)
                 if 'datasetId' in report_json:
                     report_json['datasetId'] = semantic_model_id
-                content = json.dumps(report_json, indent=2).encode('utf-8')
+                    content = json.dumps(report_json, indent=2).encode('utf-8')
 
             payload = base64.b64encode(content).decode('utf-8')
             parts.append({
@@ -194,8 +243,9 @@ class ReportOperations:
         
         # Track relationship if rebinding occurred
         if semantic_model_id:
-            # Get semantic model name from workspace
-            items = self.client.list_workspace_items(workspace_id, 'SemanticModel')
+            # Get semantic model name from its workspace (may differ from the report's)
+            model_workspace_id = semantic_model_workspace_id or workspace_id
+            items = self.client.list_workspace_items(model_workspace_id, 'SemanticModel')
             model_name = next(
                 (item['displayName'] for item in items if item['id'] == semantic_model_id),
                 'Unknown'

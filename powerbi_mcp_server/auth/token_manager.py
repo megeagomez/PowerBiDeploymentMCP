@@ -19,6 +19,27 @@ class TokenStorageError(Exception):
     pass
 
 
+def encrypt_data(data: str) -> bytes:
+    """Encrypt a string using Windows DPAPI (current user scope)."""
+    try:
+        return win32crypt.CryptProtectData(
+            data.encode('utf-8'), None, None, None, None, 0
+        )
+    except Exception as e:
+        logger.error(f"Encryption failed: {e}")
+        raise TokenStorageError(f"Failed to encrypt data: {e}")
+
+
+def decrypt_data(encrypted_data: bytes) -> str:
+    """Decrypt DPAPI-protected bytes back to a string."""
+    try:
+        decrypted = win32crypt.CryptUnprotectData(encrypted_data, None, None, None, 0)
+        return decrypted[1].decode('utf-8')
+    except Exception as e:
+        logger.error(f"Decryption failed: {e}")
+        raise TokenStorageError(f"Failed to decrypt data: {e}")
+
+
 class AuthenticationStateManager:
     """
     Manages authentication state including token caching and refresh
@@ -42,51 +63,12 @@ class AuthenticationStateManager:
         logger.info(f"Token cache directory: {self.cache_dir}")
     
     def _encrypt_data(self, data: str) -> bytes:
-        """
-        Encrypt data using Windows DPAPI
-        
-        Args:
-            data: String data to encrypt
-            
-        Returns:
-            Encrypted bytes
-        """
-        try:
-            encrypted = win32crypt.CryptProtectData(
-                data.encode('utf-8'),
-                None,  # Optional entropy
-                None,  # Reserved
-                None,  # Prompt struct
-                None,  # Flags
-                0      # Flags
-            )
-            return encrypted
-        except Exception as e:
-            logger.error(f"Encryption failed: {e}")
-            raise TokenStorageError(f"Failed to encrypt token data: {e}")
-    
+        """Encrypt data using Windows DPAPI"""
+        return encrypt_data(data)
+
     def _decrypt_data(self, encrypted_data: bytes) -> str:
-        """
-        Decrypt data using Windows DPAPI
-        
-        Args:
-            encrypted_data: Encrypted bytes
-            
-        Returns:
-            Decrypted string
-        """
-        try:
-            decrypted = win32crypt.CryptUnprotectData(
-                encrypted_data,
-                None,
-                None,
-                None,
-                0
-            )
-            return decrypted[1].decode('utf-8')
-        except Exception as e:
-            logger.error(f"Decryption failed: {e}")
-            raise TokenStorageError(f"Failed to decrypt token data: {e}")
+        """Decrypt data using Windows DPAPI"""
+        return decrypt_data(encrypted_data)
     
     def save_tokens(self, auth_result: Dict) -> None:
         """

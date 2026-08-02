@@ -9,10 +9,10 @@ Uso:
   python pbi_cli.py workspaces [--filter "name eq 'Dev'"]
   python pbi_cli.py contents <workspace>  [--type SemanticModel|Report|Dashboard]
   python pbi_cli.py models <workspace>
-  python pbi_cli.py download-model <workspace> <model> <ruta_destino> [--format pbix|pbip]
+  python pbi_cli.py download-model <workspace> <model> <ruta_destino>
   python pbi_cli.py upload-model <workspace> <ruta_origen> [--name <nombre>]
   python pbi_cli.py download-workspace <workspace> <carpeta_destino>
-  python pbi_cli.py download-report <workspace> <report> <ruta_destino> [--format pbir|json]
+  python pbi_cli.py download-report <workspace> <report> <ruta_destino>
   python pbi_cli.py upload-report <workspace> <ruta_origen> [--name <nombre>] [--rebind <modelo>]
   python pbi_cli.py history <artefacto> [--type SemanticModel|Report]
   python pbi_cli.py deployments <workspace>
@@ -20,10 +20,12 @@ Uso:
   python pbi_cli.py config-report <report> <workspace_destino> [--model <modelo>] [--auto]
   python pbi_cli.py list-configs [--type SemanticModel|Report]
   python pbi_cli.py setup-env <workspace> [--models M1,M2] [--reports "R1=M1,R2=M2"]
+  python pbi_cli.py download-definitions <workspace> <carpeta_destino>
 """
 
 import argparse
 import asyncio
+import base64
 import json
 import sys
 import threading
@@ -278,40 +280,20 @@ def cmd_download_model(args):
         sys.exit(1)
     ok(f"ID: {dataset['id']}")
 
-    fmt = getattr(args, "format", None) or "pbip"
     target = clean_path(args.path)
-    step(f"Descargando como {fmt.upper()} → {target}")
+    step(f"Descargando como PBIP → {target}")
 
-    result = None
-    pbix_fallback = False
     with Spinner(f"Descargando {args.model}"):
-        if fmt == "pbix":
-            try:
-                result = asyncio.run(sm_ops.download_pbix(
-                    ws['id'], args.workspace, dataset['id'], args.model, target
-                ))
-            except Exception as e:
-                if "404" in str(e) or "Not Found" in str(e):
-                    pbix_fallback = True
-                    fmt = "pbip"
-                else:
-                    raise
-        if fmt == "pbip":
-            result = asyncio.run(sm_ops.download_pbip(
-                ws['id'], args.workspace, dataset['id'], args.model, target
-            ))
+        result = asyncio.run(sm_ops.download_pbip(
+            ws['id'], args.workspace, dataset['id'], args.model, target
+        ))
 
-    if pbix_fallback:
-        warn("PBIX export no disponible para este modelo (Fabric-native). Descargado como PBIP.")
-
-    if fmt == "pbix":
-        ok(f"Guardado en: {result.get('file_path', str(target))}")
-        ok(f"Tamaño: {result.get('size_bytes', 0):,} bytes")
-    else:
-        ok(f"Carpeta modelo: {result.get('directory_path', str(target))}")
-        ok(f"Partes: {result.get('parts_count', '?')}")
-        if result.get('pbip_path'):
-            ok(f"Abrir en PBI Desktop: {result['pbip_path']}")
+    ok(f"Carpeta modelo: {result.get('directory_path', str(target))}")
+    ok(f"Partes: {result.get('parts_count', '?')}")
+    if result.get('versioned'):
+        ok(f"Versión anterior conservada con sufijo: {result['version_suffix']}")
+    if result.get('pbip_path'):
+        ok(f"Abrir en PBI Desktop: {result['pbip_path']}")
 
 
 def cmd_upload_model(args):
@@ -412,15 +394,29 @@ def cmd_upload_report(args):
         step(f"Buscando modelo para rebind: '{rebind}'...")
         models = client.list_workspace_items(model_ws['id'], 'SemanticModel')
         model = next((m for m in models if m['displayName'] == rebind), None)
-        if not model:
-            err(f"Modelo no encontrado para rebind: {rebind}")
-            sys.exit(1)
-        semantic_model_id = model['id']
+        if model:
+            semantic_model_id = model['id']
+        else:
+            # Modelo aún no publicado: si existe la carpeta hermana del PBIP, desplegarlo primero
+            sibling = source.parent / f"{rebind}.SemanticModel"
+            if sibling.is_dir():
+                warn(f"Modelo '{rebind}' no publicado aún — desplegando primero desde {sibling.name}")
+                sm_ops = SemanticModelOperations(client, metadata)
+                with Spinner(f"Subiendo modelo {rebind}"):
+                    model_result = asyncio.run(sm_ops.upload_pbip(
+                        model_ws['id'], model_ws.get('name', args.workspace), sibling, rebind
+                    ))
+                semantic_model_id = model_result['dataset_id']
+                ok(f"Modelo desplegado: {rebind} ({semantic_model_id})")
+            else:
+                err(f"Modelo no encontrado para rebind: {rebind}")
+                sys.exit(1)
         ok(f"Rebind a: {rebind} ({semantic_model_id})")
 
     with Spinner(f"Subiendo {report_name}"):
         result = asyncio.run(rep_ops.upload_pbir(
-            ws['id'], args.workspace, source, report_name, semantic_model_id
+            ws['id'], args.workspace, source, report_name, semantic_model_id,
+            semantic_model_workspace_id=(model_ws['id'] if rebind else None)
         ))
 
     op = result.get('operation', 'publicado')
@@ -521,6 +517,90 @@ def cmd_download_workspace(args):
     print()
     ok(f"Completado. Carpeta: {dest}")
     ok(f"Modelos: {len(models)}  Informes: {len(reports)}  Errores: {len(errors)}")
+    if errors:
+        warn("Errores:")
+        for e in errors:
+            print(f"    {e}")
+
+
+def cmd_download_definitions(args):
+    header(f"Descargando definiciones del workspace '{args.workspace}'")
+    client, _ = get_client()
+
+    step(f"Buscando workspace '{args.workspace}'...")
+    ws = client.get_workspace_by_name(args.workspace)
+    if not ws:
+        err(f"Workspace no encontrado: {args.workspace}")
+        sys.exit(1)
+    ws_id = ws['id']
+    ok(f"ID: {ws_id}")
+
+    dest = clean_path(args.path)
+    dest.mkdir(parents=True, exist_ok=True)
+    step(f"Destino: {dest}")
+
+    with Spinner("Listando elementos del workspace"):
+        items = client.list_workspace_items(ws_id)
+    ok(f"{len(items)} elemento(s) en el workspace")
+
+    downloaded = []
+    skipped = []
+    errors = []
+
+    for item in items:
+        name = item.get('displayName', '?')
+        item_type = item.get('type', '?')
+        item_id = item.get('id', '')
+
+        step(f"[{item_type}] {name}")
+        try:
+            with Spinner(f"getDefinition {name}"):
+                definition = client.get_item_definition(ws_id, item_id)
+            parts = (definition.get('definition') or {}).get('parts', [])
+            if not parts:
+                skipped.append(f"{name} ({item_type}) — definición vacía")
+                warn(f"  Sin partes, omitido")
+                continue
+
+            item_dir = dest / f"{name}.{item_type}"
+            item_dir.mkdir(parents=True, exist_ok=True)
+
+            for part in parts:
+                part_path = part.get('path')
+                payload = part.get('payload')
+                payload_type = part.get('payloadType')
+                if not part_path or not payload:
+                    continue
+                if payload_type == 'InlineBase64':
+                    content = base64.b64decode(payload)
+                else:
+                    content = payload.encode('utf-8')
+                file_path = item_dir / part_path
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_bytes(content)
+
+            downloaded.append(f"{name} ({item_type}) — {len(parts)} partes")
+            ok(f"  {name} — {len(parts)} partes → {item_dir.name}")
+        except Exception as e:
+            msg = str(e)
+            if any(k in msg for k in ("ItemNotFound", "404", "not supported", "NotSupported", "400")):
+                skipped.append(f"{name} ({item_type}) — no soporta getDefinition")
+                warn(f"  No soporta getDefinition, omitido")
+            else:
+                errors.append(f"{name} ({item_type}): {msg}")
+                err(f"  {msg}")
+
+    print()
+    ok(f"Completado. Carpeta: {dest}")
+    ok(f"Descargados: {len(downloaded)}  Omitidos: {len(skipped)}  Errores: {len(errors)}")
+    if downloaded:
+        print(c("  Descargados:", BOLD))
+        for d in downloaded:
+            print(f"    {d}")
+    if skipped:
+        print(c("  Omitidos:", DIM))
+        for s in skipped:
+            print(f"    {s}")
     if errors:
         warn("Errores:")
         for e in errors:
@@ -739,12 +819,16 @@ def build_parser() -> argparse.ArgumentParser:
     pdw.add_argument("workspace")
     pdw.add_argument("path", help="Carpeta destino")
 
+    # download-definitions
+    pdd = sub.add_parser("download-definitions", help="Descargar todos los artefactos que soporten getDefinition")
+    pdd.add_argument("workspace")
+    pdd.add_argument("path", help="Carpeta destino")
+
     # download-model
     pdm = sub.add_parser("download-model", help="Descargar modelo semántico")
     pdm.add_argument("workspace")
     pdm.add_argument("model")
     pdm.add_argument("path", help="Carpeta base del proyecto PBIP (ej: D:\\Demo\\)")
-    pdm.add_argument("--format", choices=["pbix", "pbip"], default="pbip")
 
     # upload-model
     pum = sub.add_parser("upload-model", help="Subir modelo semántico")
@@ -757,7 +841,6 @@ def build_parser() -> argparse.ArgumentParser:
     pdr.add_argument("workspace")
     pdr.add_argument("report")
     pdr.add_argument("path", help="Carpeta base del proyecto PBIP (ej: D:\\Demo\\)")
-    pdr.add_argument("--format", choices=["pbir", "json"], default="pbir")
 
     # upload-report
     pur = sub.add_parser("upload-report", help="Subir informe")
@@ -814,6 +897,7 @@ COMMANDS = {
     "workspaces":         cmd_workspaces,
     "contents":           cmd_contents,
     "models":             cmd_models,
+    "download-definitions": cmd_download_definitions,
     "download-workspace": cmd_download_workspace,
     "download-model":     cmd_download_model,
     "upload-model":   cmd_upload_model,

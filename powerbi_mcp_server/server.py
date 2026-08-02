@@ -73,6 +73,14 @@ class PowerBIMCPServer:
         async def call_tool(name: str, arguments: Dict[str, Any]):
             logger.info(f"Executing tool: {name}")
             logger.debug(f"Arguments: {arguments}")
+
+            # Only registered tools are callable — never dispatch arbitrary
+            # attribute names (e.g. private handler methods) via getattr
+            if name not in TOOL_SCHEMAS:
+                msg = f"Unknown tool: {name}"
+                logger.error(msg)
+                return [TextContent(type="text", text=json.dumps({"success": False, "error": msg}))]
+
             try:
                 handler_method = getattr(self.tool_handlers, name)
                 result = await handler_method(arguments or {})

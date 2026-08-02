@@ -45,8 +45,9 @@ TOOL_SCHEMAS: Dict[str, Dict] = {
     
     "download_semantic_model": {
         "name": "download_semantic_model",
-        "description": "Download / descargar a Power BI semantic model (dataset) from a workspace to a local file. "
-                      "Supports PBIX and PBIP formats. Use this to backup or export a semantic model.",
+        "description": "Download / descargar a Power BI semantic model (dataset) from a workspace to a local folder "
+                      "in PBIP format (project folder). Use this to backup or export a semantic model. "
+                      "(PBIX download is not supported by the Power BI API — export is report-level only.)",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -60,12 +61,12 @@ TOOL_SCHEMAS: Dict[str, Dict] = {
                 },
                 "target_path": {
                     "type": "string",
-                    "description": "Ruta local donde guardar el archivo/carpeta"
+                    "description": "Carpeta base del proyecto PBIP donde guardar el modelo"
                 },
                 "format": {
                     "type": "string",
-                    "description": "Formato de descarga: 'pbix' o 'pbip'. Si no se especifica, se detecta automáticamente.",
-                    "enum": ["pbix", "pbip"]
+                    "description": "Formato de descarga (solo 'pbip' está soportado)",
+                    "enum": ["pbip"]
                 }
             },
             "required": ["workspace_name", "dataset_name", "target_path"]
@@ -98,8 +99,8 @@ TOOL_SCHEMAS: Dict[str, Dict] = {
     
     "download_report": {
         "name": "download_report",
-        "description": "Download / descargar a Power BI report from a workspace to a local folder. "
-                      "Supports PBIR (modern) and legacy JSON formats. Use this to backup or export a report.",
+        "description": "Download / descargar a Power BI report from a workspace to a local folder "
+                      "in PBIR format (modern report project format). Use this to backup or export a report.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -113,12 +114,7 @@ TOOL_SCHEMAS: Dict[str, Dict] = {
                 },
                 "target_path": {
                     "type": "string",
-                    "description": "Ruta local donde guardar la carpeta del informe"
-                },
-                "format": {
-                    "type": "string",
-                    "description": "Formato de descarga: 'pbir' o 'json'. Si no se especifica, se usa 'pbir'.",
-                    "enum": ["pbir", "json"]
+                    "description": "Carpeta base del proyecto PBIP donde guardar el informe"
                 }
             },
             "required": ["workspace_name", "report_name", "target_path"]
@@ -127,8 +123,11 @@ TOOL_SCHEMAS: Dict[str, Dict] = {
     
     "upload_report": {
         "name": "upload_report",
-        "description": "Upload / publicar / deploy a Power BI report from a local folder to a workspace. "
-                      "Supports PBIR and legacy JSON formats. Can rebind the report to a different semantic model.",
+        "description": "Upload / publicar / deploy a Power BI report (PBIR folder) from a local folder to a workspace. "
+                      "Can rebind the report to a semantic model in the same or a different workspace "
+                      "(patches definition.pbir automatically). If the rebind model is not published yet but its "
+                      ".SemanticModel folder sits next to the report folder, the model is deployed first. "
+                      "If several models match the rebind name, returns 'needs_disambiguation' with candidates.",
         "inputSchema": {
             "type": "object",
             "properties": {

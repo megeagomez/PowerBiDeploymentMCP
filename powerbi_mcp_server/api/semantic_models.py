@@ -7,6 +7,7 @@ Handles download and upload of semantic models in all formats (PBIX, PBIP).
 import base64
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -23,56 +24,10 @@ class SemanticModelOperations:
         self.client = client
         self.metadata = metadata_manager
     
-    async def download_pbix(
-        self,
-        workspace_id: str,
-        workspace_name: str,
-        dataset_id: str,
-        dataset_name: str,
-        target_path: Path,
-        user_email: Optional[str] = None
-    ) -> Dict:
-        """
-        Download semantic model in PBIX format
-        
-        Returns:
-            Dict with download result including file path and metadata
-        """
-        logger.info(f"Downloading PBIX: {dataset_name} from workspace {workspace_name}")
-        
-        # Apply versioning
-        actual_path, version_suffix = self.metadata.prepare_download_path(target_path)
-        
-        # Download from API
-        content = self.client.export_semantic_model(workspace_id, dataset_id, format='pbix')
-        
-        # Save to file
-        actual_path.parent.mkdir(parents=True, exist_ok=True)
-        actual_path.write_bytes(content)
-        
-        # Record metadata
-        download_id = self.metadata.record_download(
-            artifact_name=dataset_name,
-            artifact_type='SemanticModel',
-            workspace_id=workspace_id,
-            workspace_name=workspace_name,
-            local_file_path=actual_path,
-            version_suffix=version_suffix,
-            user_email=user_email
-        )
-        
-        logger.info(f"Downloaded PBIX: {actual_path} ({len(content)} bytes)")
-        
-        return {
-            'success': True,
-            'file_path': str(actual_path),
-            'format': 'pbix',
-            'size_bytes': len(content),
-            'versioned': version_suffix is not None,
-            'version_suffix': version_suffix,
-            'download_id': download_id
-        }
-    
+    # NOTE: PBIX download for semantic models was removed — the Power BI REST
+    # API has no dataset-level export endpoint (export is report-level only).
+    # Semantic models are downloaded as PBIP via the Fabric definition API.
+
     async def download_pbip(
         self,
         workspace_id: str,
@@ -100,6 +55,17 @@ class SemanticModelOperations:
 
         # Build proper .SemanticModel folder (PBI Desktop convention)
         sm_dir = target_dir / f"{dataset_name}.SemanticModel"
+
+        # Versioning: outside a Git repo, keep a timestamped copy of a previous
+        # download instead of silently overwriting it (inside Git, history
+        # already protects the previous version).
+        version_suffix = None
+        if sm_dir.is_dir() and any(sm_dir.iterdir()) and not self.metadata.is_git_controlled(target_dir):
+            version_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_dir = target_dir / f"{dataset_name}_{version_suffix}.SemanticModel"
+            sm_dir.rename(backup_dir)
+            logger.info(f"Preserved previous download as: {backup_dir.name}")
+
         sm_dir.mkdir(parents=True, exist_ok=True)
 
         # Save each part
@@ -141,7 +107,7 @@ class SemanticModelOperations:
             workspace_id=workspace_id,
             workspace_name=workspace_name,
             local_file_path=sm_dir,
-            version_suffix=None,
+            version_suffix=version_suffix,
             user_email=user_email
         )
 
@@ -153,6 +119,8 @@ class SemanticModelOperations:
             'pbip_path': str(pbip_path),
             'format': 'pbip',
             'parts_count': len(parts),
+            'versioned': version_suffix is not None,
+            'version_suffix': version_suffix,
             'download_id': download_id
         }
     

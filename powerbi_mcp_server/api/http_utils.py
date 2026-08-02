@@ -61,13 +61,18 @@ def request_with_retry(
             
             # Check for rate limiting (429)
             if e.response.status_code == 429 and attempt < max_retries:
-                wait_time = backoff_factor ** attempt
+                # Honor Retry-After header when present, else exponential backoff.
+                # NOTE: never write to stdout here — in MCP stdio mode stdout is
+                # the JSON-RPC transport and any print corrupts the protocol.
+                retry_after = e.response.headers.get('Retry-After')
+                try:
+                    wait_time = float(retry_after) if retry_after else float(backoff_factor ** attempt)
+                except (TypeError, ValueError):
+                    wait_time = float(backoff_factor ** attempt)
                 logger.warning(
                     f"Rate limit hit (429), retrying in {wait_time}s... "
                     f"(attempt {attempt + 1}/{max_retries})"
                 )
-                print(f"      ⚠️  Rate limit alcanzado (429), reintentando en {wait_time}s... "
-                      f"(intento {attempt + 1}/{max_retries})")
                 time.sleep(wait_time)
                 continue
             

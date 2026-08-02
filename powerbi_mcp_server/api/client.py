@@ -6,8 +6,7 @@ Wraps Power BI and Fabric API endpoints with authentication and error handling.
 
 import logging
 import time
-from typing import Dict, List, Optional, Any
-from urllib.parse import urlencode
+from typing import Callable, Dict, List, Optional, Union
 
 import requests
 
@@ -25,19 +24,32 @@ class PowerBIClient:
     POWERBI_BASE_URL = "https://api.powerbi.com/v1.0/myorg"
     FABRIC_BASE_URL = "https://api.fabric.microsoft.com/v1"
     
-    def __init__(self, access_token: str):
+    def __init__(self, token_or_provider: Union[str, Callable[[], Optional[str]]]):
         """
         Initialize the Power BI API client
-        
+
         Args:
-            access_token: Bearer token for authentication
+            token_or_provider: Bearer token string, or a zero-arg callable that
+                returns the current token. Prefer the callable: headers are built
+                per-request, so a token refreshed on disk is picked up without
+                recreating the client (avoids 401s after token expiry).
         """
-        self.access_token = access_token
-        self.headers = {
-            'Authorization': f'Bearer {access_token}',
+        if callable(token_or_provider):
+            self._token_provider = token_or_provider
+        else:
+            self._token_provider = lambda: token_or_provider
+        logger.info("Power BI API client initialized")
+
+    @property
+    def access_token(self) -> Optional[str]:
+        return self._token_provider()
+
+    @property
+    def headers(self) -> Dict[str, str]:
+        return {
+            'Authorization': f'Bearer {self.access_token}',
             'Content-Type': 'application/json'
         }
-        logger.info("Power BI API client initialized")
     
     def _log_request(self, method: str, url: str, **kwargs):
         """Log API request details"""
@@ -99,7 +111,9 @@ class PowerBIClient:
             Workspace dictionary if found, None otherwise
         """
         try:
-            filter_query = f"name eq '{workspace_name}'"
+            # OData string literals escape single quotes by doubling them
+            escaped_name = workspace_name.replace("'", "''")
+            filter_query = f"name eq '{escaped_name}'"
             workspaces = self.list_workspaces(filter_query=filter_query)
             
             for workspace in workspaces:
@@ -196,39 +210,21 @@ class PowerBIClient:
             raise
 
     # Semantic Model operations
-    
-    def export_semantic_model(self, workspace_id: str, dataset_id: str, format: str = 'pbix') -> bytes:
+
+    # NOTE: there is no dataset-level PBIX export endpoint in the Power BI REST
+    # API (export is report-level only), so semantic models download as PBIP.
+
+    def _poll_lro_operation(self, location_url: str, max_wait_seconds: int = 600) -> Dict:
+        """Poll a Fabric Long Running Operation until it succeeds or fails.
+
+        Honors the Retry-After header between polls (falls back to 2s).
         """
-        Export a semantic model (PBIX format)
-        
-        Args:
-            workspace_id: ID of the workspace
-            dataset_id: ID of the dataset/semantic model
-            format: Export format (currently only 'pbix' supported)
-            
-        Returns:
-            Binary content of the exported file
-        """
-        url = f"{self.POWERBI_BASE_URL}/groups/{workspace_id}/datasets/{dataset_id}/export"
-        
-        try:
-            self._log_request('POST', url)
-            response = request_with_retry('POST', url, headers=self.headers)
-            logger.info(f"Exported semantic model {dataset_id} ({len(response.content)} bytes)")
-            return response.content
-        except Exception as e:
-            self._handle_error(e, f"Export semantic model: {dataset_id}")
-            raise
-    
-    def _poll_lro_operation(self, location_url: str, max_wait_seconds: int = 120) -> Dict:
-        """Poll a Fabric Long Running Operation until it succeeds or fails."""
         start = time.time()
         while True:
             if time.time() - start > max_wait_seconds:
                 raise APIError(f"LRO operation timed out after {max_wait_seconds}s: {location_url}")
 
-            response = requests.get(location_url, headers=self.headers)
-            response.raise_for_status()
+            response = request_with_retry('GET', location_url, headers=self.headers)
             status_data = response.json()
 
             status = status_data.get('status', '')
@@ -236,10 +232,11 @@ class PowerBIClient:
 
             if status == 'Succeeded':
                 result_url = location_url.rstrip('/') + '/result'
+                # Some operations (e.g. updateDefinition) have no result payload
+                # and answer 4xx here — treat any error as an empty result.
                 result_response = requests.get(result_url, headers=self.headers)
                 if result_response.status_code == 204 or not result_response.content:
                     return {}
-                # Some operations (e.g. updateDefinition) return 4xx "no result" — treat as empty
                 if not result_response.ok:
                     return {}
                 try:
@@ -250,7 +247,12 @@ class PowerBIClient:
                 error_info = status_data.get('error', {})
                 raise APIError(f"LRO operation {status}: {error_info.get('message', 'Unknown error')}")
 
-            time.sleep(2)
+            retry_after = response.headers.get('Retry-After')
+            try:
+                delay = float(retry_after) if retry_after else 2.0
+            except (TypeError, ValueError):
+                delay = 2.0
+            time.sleep(min(delay, 30.0))
 
     def get_item_definition(self, workspace_id: str, item_id: str) -> Dict:
         """
@@ -264,7 +266,7 @@ class PowerBIClient:
 
         try:
             self._log_request('POST', url)
-            response = requests.post(url, headers=self.headers)
+            response = request_with_retry('POST', url, headers=self.headers)
 
             if response.status_code == 202:
                 location = response.headers.get('Location')
@@ -273,7 +275,6 @@ class PowerBIClient:
                 logger.info(f"getDefinition is async, polling LRO: {location}")
                 definition = self._poll_lro_operation(location)
             else:
-                response.raise_for_status()
                 definition = response.json()
 
             raw_def = definition.get('definition') or {}
@@ -330,7 +331,7 @@ class PowerBIClient:
 
         try:
             self._log_request('POST', url, json=payload)
-            response = requests.post(url, headers=self.headers, json=payload)
+            response = request_with_retry('POST', url, headers=self.headers, json=payload)
 
             if response.status_code == 202:
                 location = response.headers.get('Location')
@@ -339,7 +340,6 @@ class PowerBIClient:
                 logger.info(f"createItem is async, polling LRO: {location}")
                 item = self._poll_lro_operation(location)
             else:
-                response.raise_for_status()
                 item = response.json()
 
             logger.info(f"Created {item_type}: {display_name} (ID: {item.get('id')})")
@@ -358,15 +358,13 @@ class PowerBIClient:
 
         try:
             self._log_request('POST', url, json=payload)
-            response = requests.post(url, headers=self.headers, json=payload)
+            response = request_with_retry('POST', url, headers=self.headers, json=payload)
 
             if response.status_code == 202:
                 location = response.headers.get('Location')
                 if location:
                     logger.info(f"updateDefinition is async, polling LRO: {location}")
                     self._poll_lro_operation(location)
-            else:
-                response.raise_for_status()
 
             logger.info(f"Updated item definition: {item_id}")
         except Exception as e:
