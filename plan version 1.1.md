@@ -12,24 +12,21 @@ Plan de trabajo derivado de la revisión de código del 2026-08-02. Separado en 
 
 - **Archivos:** `powerbi_mcp_server/api/reports.py` (método `upload_pbir`, ~línea 151), `powerbi_mcp_server/tools/handlers.py` (método `upload_report`).
 - **Causa:** al subir con rebind solo se parchea `datasetId` dentro de `report.json`. En el formato PBIR moderno el enlace al modelo vive en **`definition.pbir`**, en el bloque `datasetReference`. Un PBIP descargado trae `{"datasetReference": {"byPath": {"path": "../X.SemanticModel"}}}`; si el informe se sube solo o a un workspace distinto del modelo, Fabric no encuentra el sibling y la subida falla.
-- **Fix:** en `upload_pbir`, cuando se recibe `semantic_model_id` y el part procesado es `definition.pbir`, reescribir el `datasetReference` de `byPath` a `byConnection` (patrón usado por fabric-cicd de Microsoft):
+- **Fix:** en `upload_pbir`, cuando se recibe `semantic_model_id` y el part procesado es `definition.pbir`, reescribir el `datasetReference` de `byPath` a `byConnection`. Esquema confirmado contra la documentación oficial de Microsoft ([Report definition - Microsoft Fabric REST APIs](https://learn.microsoft.com/en-us/rest/api/fabric/articles/item-management/definitions/report-definition), `definitionProperties/2.0.0`) — es mucho más simple de lo que sugieren blogs/herramientas de terceros, un único campo `connectionString`:
 
   ```json
   {
     "datasetReference": {
       "byConnection": {
-        "connectionString": null,
-        "pbiServiceModelId": null,
-        "pbiModelVirtualServerName": "sobe_wowvirtualserver",
-        "pbiModelDatabaseName": "<semantic_model_id>",
-        "name": "EntityDataSource",
-        "connectionType": "pbiServiceXmlaStyleLive"
+        "connectionString": "semanticmodelid=<semantic_model_id>"
       }
     }
   }
   ```
 
-  Conservar el campo `version` que traiga el archivo original. Mantener el parche de `report.json` para informes legacy.
+  (Nota histórica: la primera implementación usó un esquema con `pbiServiceModelId`/`pbiModelVirtualServerName`/`pbiModelDatabaseName`/`name`/`connectionType`, copiado de patrones de pbi-tools/PBIX legacy. Fabric lo rechaza con "schema does not allow additional properties". El esquema correcto es solo `connectionString`.)
+
+  Conservar `$schema` y `version` que traiga el archivo original. Mantener el parche de `report.json` para informes legacy.
 - **Además:** en `handlers.upload_report`, si el directorio origen es un proyecto PBIP que contiene también carpeta `*.SemanticModel` hermana y se pide rebind a un modelo que aún no existe en el workspace destino del modelo, desplegar primero el modelo y usar su ID para el rebind (orquestación modelo → informe).
 - **Aceptación:** subir un PBIP con informe y modelo, informe al workspace A y modelo al workspace B, en una sola operación, sin staging intermedio ni mover artefactos después. El informe queda enlazado al modelo de B.
 

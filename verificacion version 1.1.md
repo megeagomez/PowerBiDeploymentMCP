@@ -33,6 +33,10 @@ Guía paso a paso para comprobar cada bug corregido (B1–B11 del `plan version 
 ```
 
 2. Comprueba que `D:\PruebaPBIP\MiInforme.Report\definition.pbir` contiene `byPath` (referencia local).
+   Tras el paso 4, si vuelves a descargar el informe, `definition.pbir` debe contener
+   `"byConnection": {"connectionString": "semanticmodelid=<GUID>"}` — ese es el único
+   campo del esquema real (confirmado contra la documentación oficial de Microsoft;
+   la primera versión del fix usaba campos adicionales que Fabric rechazaba).
 3. Sube **el modelo al workspace de modelos**:
 
 ```bash

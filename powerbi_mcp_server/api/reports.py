@@ -131,18 +131,17 @@ class ReportOperations:
         PBIP projects reference their model by relative path (byPath), which
         only resolves when report and model are uploaded together to the same
         workspace. byConnection binds the report to the model's ID instead, so
-        the report and its model can live in different workspaces (same
-        pattern Microsoft's fabric-cicd uses).
+        the report and its model can live in different workspaces.
+
+        Schema per Microsoft's official docs (definitionProperties/2.0.0):
+        https://learn.microsoft.com/en-us/rest/api/fabric/articles/item-management/definitions/report-definition
+        byConnection takes a single connectionString field formatted as
+        "semanticmodelid=<GUID>" — no other properties are allowed.
         """
         pbir = json.loads(content)
         pbir['datasetReference'] = {
             'byConnection': {
-                'connectionString': None,
-                'pbiServiceModelId': None,
-                'pbiModelVirtualServerName': 'sobe_wowvirtualserver',
-                'pbiModelDatabaseName': semantic_model_id,
-                'name': 'EntityDataSource',
-                'connectionType': 'pbiServiceXmlaStyleLive',
+                'connectionString': f'semanticmodelid={semantic_model_id}'
             }
         }
         return json.dumps(pbir, indent=2).encode('utf-8')
