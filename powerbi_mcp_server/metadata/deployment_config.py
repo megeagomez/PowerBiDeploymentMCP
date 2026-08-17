@@ -102,28 +102,34 @@ class DeploymentConfigManager:
             'reports': report_configs
         }
     
-    def get_deployment_config_for_model(self, model_name: str) -> Optional[Dict]:
+    def get_deployment_config_for_model(self, model_name: str, profile_name: Optional[str] = None) -> Optional[Dict]:
         """
-        Get deployment configuration for a semantic model
-        
+        Get deployment configuration for a semantic model, optionally scoped to
+        one environment (profile_name). Without profile_name, returns the most
+        recently created config regardless of environment (legacy behaviour).
+
         Returns:
             Configuration dict or None if not configured
         """
-        config = self.db.get_semantic_model_config(model_name)
+        profile_id = self.resolve_profile_id(profile_name)
+        config = self.db.get_semantic_model_config(model_name, profile_id=profile_id)
         if config:
             logger.info(f"Found config for model: {model_name} -> {config['target_workspace_name']}")
         else:
             logger.info(f"No config found for model: {model_name}")
         return config
-    
-    def get_deployment_config_for_report(self, report_name: str) -> Optional[Dict]:
+
+    def get_deployment_config_for_report(self, report_name: str, profile_name: Optional[str] = None) -> Optional[Dict]:
         """
-        Get deployment configuration for a report
-        
+        Get deployment configuration for a report, optionally scoped to one
+        environment (profile_name). Without profile_name, returns the most
+        recently created config regardless of environment (legacy behaviour).
+
         Returns:
             Configuration dict or None if not configured
         """
-        config = self.db.get_report_config(report_name)
+        profile_id = self.resolve_profile_id(profile_name)
+        config = self.db.get_report_config(report_name, profile_id=profile_id)
         if config:
             logger.info(f"Found config for report: {report_name} -> {config['target_workspace_name']}")
             if config['target_semantic_model_name']:
@@ -131,6 +137,96 @@ class DeploymentConfigManager:
         else:
             logger.info(f"No config found for report: {report_name}")
         return config
+
+    def resolve_profile_id(self, profile_name: Optional[str]) -> Optional[int]:
+        if not profile_name:
+            return None
+        profile = self.db.get_deployment_profile(profile_name)
+        if not profile:
+            raise ValueError(f"Entorno desconocido: '{profile_name}'")
+        return profile['id']
+
+    # ========== Environment hierarchy (stage_order) ==========
+
+    def configure_environment(
+        self,
+        profile_name: str,
+        target_workspace_name: Optional[str] = None,
+        target_workspace_id: Optional[str] = None,
+        stage_order: Optional[int] = None,
+        environment_type: str = 'development',
+        description: Optional[str] = None
+    ) -> Dict:
+        """
+        Create or update a deployment environment (alias + optional position
+        in the promotion chain). target_workspace_name can be omitted for an
+        environment that only ever gets used through per-project workspace
+        overrides (see ProjectManager.configure_project_workspace) — it just
+        won't have a default workspace of its own. Raises ValueError if
+        stage_order is already owned by a different environment.
+        """
+        if stage_order is not None:
+            for other in self.db.list_deployment_profiles():
+                if other['profile_name'] != profile_name and other.get('stage_order') == stage_order:
+                    raise ValueError(
+                        f"stage_order {stage_order} ya está asignado al entorno '{other['profile_name']}'"
+                    )
+
+        existing = self.db.get_deployment_profile(profile_name)
+        if existing:
+            self.db.update_deployment_profile(
+                profile_name,
+                target_workspace_id=target_workspace_id,
+                target_workspace_name=target_workspace_name,
+                stage_order=stage_order,
+                environment_type=environment_type,
+                description=description
+            )
+            profile_id = existing['id']
+            action = 'updated'
+        else:
+            profile_id = self.db.create_deployment_profile(
+                profile_name=profile_name,
+                target_workspace_id=target_workspace_id,
+                target_workspace_name=target_workspace_name,
+                environment_type=environment_type,
+                description=description,
+                stage_order=stage_order
+            )
+            action = 'created'
+
+        return {
+            'id': profile_id,
+            'profile_name': profile_name,
+            'target_workspace_name': target_workspace_name,
+            'stage_order': stage_order,
+            'action': action
+        }
+
+    def list_environments(self) -> List[Dict]:
+        """List all environments ordered by stage_order (unordered ones last)."""
+        profiles = self.db.list_deployment_profiles()
+        return sorted(
+            profiles,
+            key=lambda p: (p.get('stage_order') is None, p.get('stage_order') or 0, p['profile_name'])
+        )
+
+    def get_predecessor_profile(self, profile_name: str) -> Optional[Dict]:
+        """
+        Resolve the environment immediately BEFORE the given one in the
+        promotion chain (the environment whose stage_order is the highest
+        value still below the target's stage_order).
+        """
+        target = self.db.get_deployment_profile(profile_name)
+        if not target or target.get('stage_order') is None:
+            return None
+        candidates = [
+            p for p in self.db.list_deployment_profiles()
+            if p.get('stage_order') is not None and p['stage_order'] < target['stage_order']
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p['stage_order'])
     
     def should_auto_deploy(self, artifact_name: str, artifact_type: str) -> Tuple[bool, Optional[Dict]]:
         """

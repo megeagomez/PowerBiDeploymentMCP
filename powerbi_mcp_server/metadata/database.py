@@ -24,7 +24,7 @@ class MetadataDatabase:
     is never held open between operations (avoids cross-process lock conflicts).
     """
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 5
 
     def __init__(self, db_path: Optional[Path] = None):
         if db_path is None:
@@ -180,6 +180,103 @@ class MetadataDatabase:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_semantic_configs_model ON semantic_model_configs(model_name)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_report_configs_report ON report_configs(report_name)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_profiles_name ON deployment_profiles(profile_name)")
+
+            # v3: environment hierarchy (stage_order) + projects + promotion/drift tracking
+            conn.execute("ALTER TABLE deployment_profiles ADD COLUMN IF NOT EXISTS stage_order INTEGER")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS projects (
+                    id INTEGER PRIMARY KEY,
+                    project_name VARCHAR UNIQUE NOT NULL,
+                    description VARCHAR,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_artifacts (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    artifact_type VARCHAR NOT NULL,
+                    artifact_name VARCHAR NOT NULL,
+                    rebind_to_artifact_name VARCHAR,
+                    sequence_order INTEGER,
+                    notes VARCHAR,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (project_id) REFERENCES projects(id),
+                    UNIQUE (project_id, artifact_type, artifact_name)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS environment_artifact_state (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    profile_id INTEGER NOT NULL,
+                    artifact_type VARCHAR NOT NULL,
+                    artifact_name VARCHAR NOT NULL,
+                    workspace_item_id VARCHAR,
+                    workspace_id VARCHAR,
+                    workspace_name VARCHAR,
+                    definition_hash VARCHAR,
+                    source_profile_id INTEGER,
+                    promotion_event_id INTEGER,
+                    last_operation VARCHAR NOT NULL,
+                    updated_by VARCHAR,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (project_id) REFERENCES projects(id),
+                    FOREIGN KEY (profile_id) REFERENCES deployment_profiles(id),
+                    UNIQUE (project_id, profile_id, artifact_type, artifact_name)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS promotion_events (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    operation VARCHAR NOT NULL,
+                    from_profile_id INTEGER,
+                    to_profile_id INTEGER NOT NULL,
+                    artifact_summary VARCHAR,
+                    drift_detected BOOLEAN DEFAULT false,
+                    drift_confirmed BOOLEAN DEFAULT false,
+                    status VARCHAR DEFAULT 'success',
+                    error_message VARCHAR,
+                    initiated_by VARCHAR,
+                    started_at TIMESTAMP NOT NULL,
+                    completed_at TIMESTAMP,
+                    FOREIGN KEY (project_id) REFERENCES projects(id),
+                    FOREIGN KEY (from_profile_id) REFERENCES deployment_profiles(id),
+                    FOREIGN KEY (to_profile_id) REFERENCES deployment_profiles(id)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_project_artifacts_project ON project_artifacts(project_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_env_state_lookup ON environment_artifact_state(project_id, profile_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_promotion_events_project ON promotion_events(project_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_profiles_stage_order ON deployment_profiles(stage_order)")
+
+            # v4: per-artifact target folder path within its workspace
+            conn.execute("ALTER TABLE project_artifacts ADD COLUMN IF NOT EXISTS folder_path VARCHAR")
+
+            # v5: per-project workspace overrides (dedicated workspaces per project/environment,
+            # optionally split by artifact type) — takes precedence over the environment's default
+            # target_workspace when resolving where to deploy/promote a given artifact.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS project_environment_workspaces (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    profile_id INTEGER NOT NULL,
+                    artifact_type VARCHAR,
+                    workspace_id VARCHAR NOT NULL,
+                    workspace_name VARCHAR NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (project_id) REFERENCES projects(id),
+                    FOREIGN KEY (profile_id) REFERENCES deployment_profiles(id)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_project_env_workspaces_lookup "
+                "ON project_environment_workspaces(project_id, profile_id)"
+            )
 
             result = conn.execute("SELECT COUNT(*) FROM schema_version WHERE version = ?", [self.SCHEMA_VERSION]).fetchone()
             if result[0] == 0:
@@ -347,22 +444,64 @@ class MetadataDatabase:
         target_workspace_id: Optional[str] = None,
         target_workspace_name: Optional[str] = None,
         environment_type: str = 'development',
-        description: Optional[str] = None
+        description: Optional[str] = None,
+        stage_order: Optional[int] = None
     ) -> int:
         with self._db() as conn:
             profile_id = self._next_id(conn, 'deployment_profiles')
             conn.execute("""
                 INSERT INTO deployment_profiles (
-                    id, profile_name, description, target_workspace_id, target_workspace_name, environment_type
-                ) VALUES (?, ?, ?, ?, ?, ?)
-            """, [profile_id, profile_name, description, target_workspace_id, target_workspace_name, environment_type])
+                    id, profile_name, description, target_workspace_id, target_workspace_name,
+                    environment_type, stage_order
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, [profile_id, profile_name, description, target_workspace_id, target_workspace_name,
+                  environment_type, stage_order])
         logger.info(f"Created deployment profile: {profile_name} (ID: {profile_id})")
         return profile_id
+
+    def update_deployment_profile(
+        self,
+        profile_name: str,
+        target_workspace_id: Optional[str] = None,
+        target_workspace_name: Optional[str] = None,
+        stage_order: Optional[int] = None,
+        environment_type: Optional[str] = None,
+        description: Optional[str] = None
+    ) -> bool:
+        updates, params = [], []
+        if target_workspace_id is not None:
+            updates.append("target_workspace_id = ?"); params.append(target_workspace_id)
+        if target_workspace_name is not None:
+            updates.append("target_workspace_name = ?"); params.append(target_workspace_name)
+        if stage_order is not None:
+            updates.append("stage_order = ?"); params.append(stage_order)
+        if environment_type is not None:
+            updates.append("environment_type = ?"); params.append(environment_type)
+        if description is not None:
+            updates.append("description = ?"); params.append(description)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(profile_name)
+        with self._db() as conn:
+            conn.execute(f"UPDATE deployment_profiles SET {', '.join(updates)} WHERE profile_name = ?", params)
+        logger.info(f"Updated deployment profile: {profile_name}")
+        return True
 
     def get_deployment_profile(self, profile_name: str) -> Optional[Dict]:
         with self._db() as conn:
             result = conn.execute(
                 "SELECT * FROM deployment_profiles WHERE profile_name = ?", [profile_name]
+            ).fetchone()
+            if result:
+                columns = [desc[0] for desc in conn.description]
+                return dict(zip(columns, result))
+        return None
+
+    def get_deployment_profile_by_id(self, profile_id: int) -> Optional[Dict]:
+        with self._db() as conn:
+            result = conn.execute(
+                "SELECT * FROM deployment_profiles WHERE id = ?", [profile_id]
             ).fetchone()
             if result:
                 columns = [desc[0] for desc in conn.description]
@@ -400,12 +539,19 @@ class MetadataDatabase:
         logger.info(f"Created semantic model config: {model_name} -> {target_workspace_name}")
         return config_id
 
-    def get_semantic_model_config(self, model_name: str) -> Optional[Dict]:
+    def get_semantic_model_config(self, model_name: str, profile_id: Optional[int] = None) -> Optional[Dict]:
         with self._db() as conn:
-            result = conn.execute(
-                "SELECT * FROM semantic_model_configs WHERE model_name = ? ORDER BY created_at DESC LIMIT 1",
-                [model_name]
-            ).fetchone()
+            if profile_id is not None:
+                result = conn.execute(
+                    "SELECT * FROM semantic_model_configs WHERE model_name = ? AND profile_id = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    [model_name, profile_id]
+                ).fetchone()
+            else:
+                result = conn.execute(
+                    "SELECT * FROM semantic_model_configs WHERE model_name = ? ORDER BY created_at DESC LIMIT 1",
+                    [model_name]
+                ).fetchone()
             if result:
                 columns = [desc[0] for desc in conn.description]
                 return dict(zip(columns, result))
@@ -457,12 +603,19 @@ class MetadataDatabase:
         logger.info(f"Created report config: {report_name} -> {target_workspace_name}")
         return config_id
 
-    def get_report_config(self, report_name: str) -> Optional[Dict]:
+    def get_report_config(self, report_name: str, profile_id: Optional[int] = None) -> Optional[Dict]:
         with self._db() as conn:
-            result = conn.execute(
-                "SELECT * FROM report_configs WHERE report_name = ? ORDER BY created_at DESC LIMIT 1",
-                [report_name]
-            ).fetchone()
+            if profile_id is not None:
+                result = conn.execute(
+                    "SELECT * FROM report_configs WHERE report_name = ? AND profile_id = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    [report_name, profile_id]
+                ).fetchone()
+            else:
+                result = conn.execute(
+                    "SELECT * FROM report_configs WHERE report_name = ? ORDER BY created_at DESC LIMIT 1",
+                    [report_name]
+                ).fetchone()
             if result:
                 columns = [desc[0] for desc in conn.description]
                 return dict(zip(columns, result))
@@ -486,7 +639,8 @@ class MetadataDatabase:
         target_workspace_id: Optional[str] = None,
         target_workspace_name: Optional[str] = None,
         auto_deploy: Optional[bool] = None,
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
+        profile_id: Optional[int] = None
     ) -> bool:
         updates, params = [], []
         if target_workspace_id is not None:
@@ -500,9 +654,13 @@ class MetadataDatabase:
         if not updates:
             return False
         updates.append("updated_at = CURRENT_TIMESTAMP")
+        where = "model_name = ?"
         params.append(model_name)
+        if profile_id is not None:
+            where += " AND profile_id = ?"
+            params.append(profile_id)
         with self._db() as conn:
-            conn.execute(f"UPDATE semantic_model_configs SET {', '.join(updates)} WHERE model_name = ?", params)
+            conn.execute(f"UPDATE semantic_model_configs SET {', '.join(updates)} WHERE {where}", params)
         logger.info(f"Updated semantic model config: {model_name}")
         return True
 
@@ -515,7 +673,8 @@ class MetadataDatabase:
         target_model_workspace_name: Optional[str] = None,
         auto_deploy: Optional[bool] = None,
         auto_rebind: Optional[bool] = None,
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
+        profile_id: Optional[int] = None
     ) -> bool:
         updates, params = [], []
         if target_workspace_id is not None:
@@ -535,11 +694,228 @@ class MetadataDatabase:
         if not updates:
             return False
         updates.append("updated_at = CURRENT_TIMESTAMP")
+        where = "report_name = ?"
         params.append(report_name)
+        if profile_id is not None:
+            where += " AND profile_id = ?"
+            params.append(profile_id)
         with self._db() as conn:
-            conn.execute(f"UPDATE report_configs SET {', '.join(updates)} WHERE report_name = ?", params)
+            conn.execute(f"UPDATE report_configs SET {', '.join(updates)} WHERE {where}", params)
         logger.info(f"Updated report config: {report_name}")
         return True
+
+    # ========== Projects & Environment Promotion (v3) ==========
+
+    def create_project(self, project_name: str, description: Optional[str] = None) -> int:
+        with self._db() as conn:
+            project_id = self._next_id(conn, 'projects')
+            conn.execute(
+                "INSERT INTO projects (id, project_name, description) VALUES (?, ?, ?)",
+                [project_id, project_name, description]
+            )
+        logger.info(f"Created project: {project_name} (ID: {project_id})")
+        return project_id
+
+    def get_project_by_name(self, project_name: str) -> Optional[Dict]:
+        with self._db() as conn:
+            result = conn.execute(
+                "SELECT * FROM projects WHERE project_name = ?", [project_name]
+            ).fetchone()
+            if result:
+                columns = [desc[0] for desc in conn.description]
+                return dict(zip(columns, result))
+        return None
+
+    def list_projects(self) -> List[Dict]:
+        with self._db() as conn:
+            result = conn.execute("SELECT * FROM projects ORDER BY project_name").fetchall()
+            columns = [desc[0] for desc in conn.description]
+        return [dict(zip(columns, row)) for row in result]
+
+    def add_project_artifact(
+        self,
+        project_id: int,
+        artifact_type: str,
+        artifact_name: str,
+        rebind_to_artifact_name: Optional[str] = None,
+        sequence_order: Optional[int] = None,
+        notes: Optional[str] = None,
+        folder_path: Optional[str] = None
+    ) -> int:
+        with self._db() as conn:
+            artifact_id = self._next_id(conn, 'project_artifacts')
+            conn.execute("""
+                INSERT INTO project_artifacts (
+                    id, project_id, artifact_type, artifact_name, rebind_to_artifact_name,
+                    sequence_order, notes, folder_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, [artifact_id, project_id, artifact_type, artifact_name, rebind_to_artifact_name,
+                  sequence_order, notes, folder_path])
+        logger.info(f"Added project artifact: {artifact_type}/{artifact_name} -> project {project_id}")
+        return artifact_id
+
+    def list_project_artifacts(self, project_id: int) -> List[Dict]:
+        with self._db() as conn:
+            result = conn.execute(
+                "SELECT * FROM project_artifacts WHERE project_id = ? ORDER BY artifact_type, artifact_name",
+                [project_id]
+            ).fetchall()
+            columns = [desc[0] for desc in conn.description]
+        return [dict(zip(columns, row)) for row in result]
+
+    def remove_project_artifact(self, project_id: int, artifact_type: str, artifact_name: str) -> bool:
+        with self._db() as conn:
+            existing = conn.execute(
+                "SELECT id FROM project_artifacts WHERE project_id = ? AND artifact_type = ? AND artifact_name = ?",
+                [project_id, artifact_type, artifact_name]
+            ).fetchone()
+            if not existing:
+                return False
+            conn.execute("DELETE FROM project_artifacts WHERE id = ?", [existing[0]])
+        logger.info(f"Removed project artifact: {artifact_type}/{artifact_name} from project {project_id}")
+        return True
+
+    def upsert_project_environment_workspace(
+        self,
+        project_id: int,
+        profile_id: int,
+        artifact_type: Optional[str],
+        workspace_id: str,
+        workspace_name: str
+    ) -> int:
+        """
+        Register (or update) the workspace a project should use for a given
+        environment, optionally scoped to one artifact type. artifact_type=None
+        means "combined" — applies to both SemanticModel and Report for that
+        (project, environment) when no more specific split override exists.
+        """
+        with self._db() as conn:
+            if artifact_type is None:
+                existing = conn.execute(
+                    "SELECT id FROM project_environment_workspaces "
+                    "WHERE project_id = ? AND profile_id = ? AND artifact_type IS NULL",
+                    [project_id, profile_id]
+                ).fetchone()
+            else:
+                existing = conn.execute(
+                    "SELECT id FROM project_environment_workspaces "
+                    "WHERE project_id = ? AND profile_id = ? AND artifact_type = ?",
+                    [project_id, profile_id, artifact_type]
+                ).fetchone()
+
+            if existing:
+                conn.execute(
+                    "UPDATE project_environment_workspaces "
+                    "SET workspace_id = ?, workspace_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    [workspace_id, workspace_name, existing[0]]
+                )
+                return existing[0]
+
+            row_id = self._next_id(conn, 'project_environment_workspaces')
+            conn.execute("""
+                INSERT INTO project_environment_workspaces (
+                    id, project_id, profile_id, artifact_type, workspace_id, workspace_name
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, [row_id, project_id, profile_id, artifact_type, workspace_id, workspace_name])
+            return row_id
+
+    def list_project_environment_workspaces(
+        self, project_id: int, profile_id: Optional[int] = None
+    ) -> List[Dict]:
+        with self._db() as conn:
+            if profile_id is not None:
+                result = conn.execute(
+                    "SELECT * FROM project_environment_workspaces WHERE project_id = ? AND profile_id = ?",
+                    [project_id, profile_id]
+                ).fetchall()
+            else:
+                result = conn.execute(
+                    "SELECT * FROM project_environment_workspaces WHERE project_id = ?", [project_id]
+                ).fetchall()
+            columns = [desc[0] for desc in conn.description]
+        return [dict(zip(columns, row)) for row in result]
+
+    def get_environment_artifact_state(
+        self, project_id: int, profile_id: int, artifact_type: str, artifact_name: str
+    ) -> Optional[Dict]:
+        with self._db() as conn:
+            result = conn.execute("""
+                SELECT * FROM environment_artifact_state
+                WHERE project_id = ? AND profile_id = ? AND artifact_type = ? AND artifact_name = ?
+            """, [project_id, profile_id, artifact_type, artifact_name]).fetchone()
+            if result:
+                columns = [desc[0] for desc in conn.description]
+                return dict(zip(columns, result))
+        return None
+
+    def upsert_environment_artifact_state(
+        self,
+        project_id: int,
+        profile_id: int,
+        artifact_type: str,
+        artifact_name: str,
+        workspace_item_id: Optional[str],
+        workspace_id: Optional[str],
+        workspace_name: Optional[str],
+        definition_hash: Optional[str],
+        source_profile_id: Optional[int],
+        last_operation: str,
+        promotion_event_id: Optional[int] = None,
+        updated_by: Optional[str] = None
+    ) -> None:
+        with self._db() as conn:
+            existing = conn.execute("""
+                SELECT id FROM environment_artifact_state
+                WHERE project_id = ? AND profile_id = ? AND artifact_type = ? AND artifact_name = ?
+            """, [project_id, profile_id, artifact_type, artifact_name]).fetchone()
+
+            if existing:
+                conn.execute("""
+                    UPDATE environment_artifact_state
+                    SET workspace_item_id = ?, workspace_id = ?, workspace_name = ?, definition_hash = ?,
+                        source_profile_id = ?, last_operation = ?, promotion_event_id = ?, updated_by = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, [workspace_item_id, workspace_id, workspace_name, definition_hash,
+                      source_profile_id, last_operation, promotion_event_id, updated_by, existing[0]])
+            else:
+                state_id = self._next_id(conn, 'environment_artifact_state')
+                conn.execute("""
+                    INSERT INTO environment_artifact_state (
+                        id, project_id, profile_id, artifact_type, artifact_name, workspace_item_id,
+                        workspace_id, workspace_name, definition_hash, source_profile_id, last_operation,
+                        promotion_event_id, updated_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [state_id, project_id, profile_id, artifact_type, artifact_name, workspace_item_id,
+                      workspace_id, workspace_name, definition_hash, source_profile_id, last_operation,
+                      promotion_event_id, updated_by])
+
+    def record_promotion_event(
+        self,
+        project_id: int,
+        operation: str,
+        to_profile_id: int,
+        from_profile_id: Optional[int] = None,
+        artifact_summary: Optional[str] = None,
+        drift_detected: bool = False,
+        drift_confirmed: bool = False,
+        status: str = 'success',
+        error_message: Optional[str] = None,
+        initiated_by: Optional[str] = None
+    ) -> int:
+        with self._db() as conn:
+            event_id = self._next_id(conn, 'promotion_events')
+            conn.execute("""
+                INSERT INTO promotion_events (
+                    id, project_id, operation, from_profile_id, to_profile_id, artifact_summary,
+                    drift_detected, drift_confirmed, status, error_message, initiated_by,
+                    started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [event_id, project_id, operation, from_profile_id, to_profile_id, artifact_summary,
+                  drift_detected, drift_confirmed, status, error_message, initiated_by,
+                  datetime.now(), datetime.now()])
+        logger.info(f"Recorded promotion event: project {project_id} {operation} -> profile {to_profile_id} ({status})")
+        return event_id
 
     def get_deployment_stats(self) -> Dict:
         with self._db() as conn:

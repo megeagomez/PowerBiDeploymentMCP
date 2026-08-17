@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "powerbi-mcp-deployment"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for managing Power BI assets with versioning and metadata tracking"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,7 @@ keywords = ["powerbi", "mcp", "semantic-model", "report", "versioning"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -26,9 +27,13 @@ classifiers = [
 dependencies = [
     "msal>=1.20.0",
     "requests>=2.28.0",
-    "pywin32>=305",
+    "pywin32>=305; sys_platform == 'win32'",
     "azure-identity>=1.12.0",
-    "mcp>=0.9.0",
+    # Upper bound intentional: mcp 2.0.0 replaced the decorator-based
+    # low-level Server API (list_tools/call_tool decorators) used in
+    # server.py with a callback-constructor API. Verified against 1.27.2,
+    # 1.28.0 and 1.28.1 — all keep the decorator API this code relies on.
+    "mcp>=0.9.0,<2.0.0",
     "duckdb>=0.9.0",
     "GitPython>=3.1.40",
     "python-dateutil>=2.8.2",

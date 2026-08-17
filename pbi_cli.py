@@ -10,17 +10,35 @@ Uso:
   python pbi_cli.py contents <workspace>  [--type SemanticModel|Report|Dashboard]
   python pbi_cli.py models <workspace>
   python pbi_cli.py download-model <workspace> <model> <ruta_destino>
-  python pbi_cli.py upload-model <workspace> <ruta_origen> [--name <nombre>]
+  python pbi_cli.py upload-model <workspace> <ruta_origen> [--name <nombre>] [--folder "Ruta/Carpeta"]
   python pbi_cli.py download-workspace <workspace> <carpeta_destino>
   python pbi_cli.py download-report <workspace> <report> <ruta_destino>
-  python pbi_cli.py upload-report <workspace> <ruta_origen> [--name <nombre>] [--rebind <modelo>]
+  python pbi_cli.py upload-report <workspace> <ruta_origen> [--name <nombre>] [--rebind <modelo>] [--folder "Ruta/Carpeta"]
   python pbi_cli.py history <artefacto> [--type SemanticModel|Report]
   python pbi_cli.py deployments <workspace>
-  python pbi_cli.py config-model <model> <workspace_destino> [--auto]
-  python pbi_cli.py config-report <report> <workspace_destino> [--model <modelo>] [--auto]
+  python pbi_cli.py config-model <model> <workspace_destino> [--auto] [--profile <entorno>]
+  python pbi_cli.py config-report <report> <workspace_destino> [--model <modelo>] [--auto] [--profile <entorno>]
   python pbi_cli.py list-configs [--type SemanticModel|Report]
   python pbi_cli.py setup-env <workspace> [--models M1,M2] [--reports "R1=M1,R2=M2"]
   python pbi_cli.py download-definitions <workspace> <carpeta_destino>
+
+  # Entornos y proyectos (despliegue multi-artefacto con jerarquía)
+  python pbi_cli.py env-create <alias> <workspace> --stage-order <N> [--type <tipo>] [--description <desc>]
+  python pbi_cli.py env-list
+  python pbi_cli.py project-create <nombre> [--description <desc>]
+  python pbi_cli.py project-add-artifact <proyecto> model|report <nombre> [--rebind <modelo>] [--order N] [--notes N] [--folder "Ruta/Carpeta"]
+  python pbi_cli.py project-remove-artifact <proyecto> model|report <nombre>
+  python pbi_cli.py project-show <nombre>
+  python pbi_cli.py project-list
+  python pbi_cli.py project-structure <nombre>                      # artefactos + carpetas + estado por entorno
+  python pbi_cli.py project-tree [nombre]                           # árbol ASCII (todos los proyectos si se omite)
+  python pbi_cli.py deploy <proyecto> <entorno> <carpeta_local> [--respect-local-structure]   # explícito, salta la cadena (hotfix)
+  python pbi_cli.py promote <proyecto> <entorno> [--yes]            # por defecto, entorno anterior -> entorno
+
+  # Creación de workspaces
+  python pbi_cli.py capacities                                                          # listar capacidades de Fabric
+  python pbi_cli.py project-provision-workspaces <proyecto> [--capacity-id ID]           # modo automático (dev/acc/prod)
+  python pbi_cli.py project-set-workspace <proyecto> <entorno> <workspace> [--type model|report] [--capacity-id ID]  # modo manual
 """
 
 import argparse
@@ -47,6 +65,7 @@ from powerbi_mcp_server.api.semantic_models import SemanticModelOperations
 from powerbi_mcp_server.api.reports import ReportOperations
 from powerbi_mcp_server.metadata import MetadataManager
 from powerbi_mcp_server.metadata.deployment_config import DeploymentConfigManager
+from powerbi_mcp_server.metadata.project_manager import ProjectManager
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +123,14 @@ def stream_lines(lines: list[str], delay: float = 0.04):
 def clean_path(s: str) -> Path:
     """Strip stray quotes PowerShell sometimes appends when a path ends with backslash."""
     return Path(s.strip('"\''))
+
+
+def confirm(msg: str) -> bool:
+    try:
+        answer = input(f"  {msg} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes", "s", "si", "sí")
 
 
 class Spinner:
@@ -318,11 +345,17 @@ def cmd_upload_model(args):
         source.name[: -len('.SemanticModel')] if source.name.endswith('.SemanticModel') else source.stem
     )
 
+    folder_path = getattr(args, "folder", None)
+
     with Spinner(f"Subiendo {dataset_name}"):
         if fmt == "pbix":
-            result = asyncio.run(sm_ops.upload_pbix(ws['id'], args.workspace, source, dataset_name))
+            result = asyncio.run(sm_ops.upload_pbix(
+                ws['id'], args.workspace, source, dataset_name, folder_path=folder_path
+            ))
         else:
-            result = asyncio.run(sm_ops.upload_pbip(ws['id'], args.workspace, source, dataset_name))
+            result = asyncio.run(sm_ops.upload_pbip(
+                ws['id'], args.workspace, source, dataset_name, folder_path=folder_path
+            ))
 
     op = result.get('operation', 'publicado')
     ok(f"{op.capitalize()}: {result.get('dataset_name', dataset_name)}")
@@ -416,7 +449,8 @@ def cmd_upload_report(args):
     with Spinner(f"Subiendo {report_name}"):
         result = asyncio.run(rep_ops.upload_pbir(
             ws['id'], args.workspace, source, report_name, semantic_model_id,
-            semantic_model_workspace_id=(model_ws['id'] if rebind else None)
+            semantic_model_workspace_id=(model_ws['id'] if rebind else None),
+            folder_path=getattr(args, "folder", None)
         ))
 
     op = result.get('operation', 'publicado')
@@ -657,22 +691,33 @@ def cmd_config_model(args):
     if not ws:
         warn("Workspace no encontrado — guardando solo el nombre")
 
-    existing = deploy_cfg.db.get_semantic_model_config(args.model)
+    profile_name = getattr(args, "profile", None)
+    profile_id = deploy_cfg.resolve_profile_id(profile_name)
     auto = getattr(args, "auto", False)
+    existing = deploy_cfg.db.get_semantic_model_config(args.model, profile_id=profile_id)
 
     with Spinner("Guardando configuración"):
         if existing:
             deploy_cfg.db.update_semantic_model_config(
-                args.model, ws_id, args.workspace_dest, auto, None
+                model_name=args.model,
+                target_workspace_id=ws_id,
+                target_workspace_name=args.workspace_dest,
+                auto_deploy=auto,
+                profile_id=profile_id
             )
             action = "actualizada"
         else:
             deploy_cfg.db.create_semantic_model_config(
-                args.model, ws_id, args.workspace_dest, auto, None
+                model_name=args.model,
+                target_workspace_id=ws_id,
+                target_workspace_name=args.workspace_dest,
+                profile_id=profile_id,
+                auto_deploy=auto
             )
             action = "creada"
 
-    ok(f"Configuración {action}: {args.model} → {args.workspace_dest}  (auto={auto})")
+    entorno = f" [{profile_name}]" if profile_name else ""
+    ok(f"Configuración {action}: {args.model} → {args.workspace_dest}{entorno}  (auto={auto})")
 
 
 def cmd_config_report(args):
@@ -694,22 +739,41 @@ def cmd_config_report(args):
         if not model_id:
             warn(f"Modelo '{model_name}' no encontrado — guardando solo nombre")
 
+    profile_name = getattr(args, "profile", None)
+    profile_id = deploy_cfg.resolve_profile_id(profile_name)
     auto = getattr(args, "auto", False)
-    existing = deploy_cfg.db.get_report_config(args.report)
+    existing = deploy_cfg.db.get_report_config(args.report, profile_id=profile_id)
 
     with Spinner("Guardando configuración"):
         if existing:
             deploy_cfg.db.update_report_config(
-                args.report, ws_id, args.workspace_dest, model_name, args.workspace_dest, auto, True, None
+                report_name=args.report,
+                target_workspace_id=ws_id,
+                target_workspace_name=args.workspace_dest,
+                target_semantic_model_name=model_name,
+                target_model_workspace_name=args.workspace_dest,
+                auto_deploy=auto,
+                auto_rebind=True,
+                profile_id=profile_id
             )
             action = "actualizada"
         else:
             deploy_cfg.db.create_report_config(
-                args.report, ws_id, args.workspace_dest, model_id, model_name, ws_id, args.workspace_dest, auto, True, None
+                report_name=args.report,
+                target_workspace_id=ws_id,
+                target_workspace_name=args.workspace_dest,
+                target_semantic_model_id=model_id,
+                target_semantic_model_name=model_name,
+                target_model_workspace_id=ws_id,
+                target_model_workspace_name=args.workspace_dest,
+                profile_id=profile_id,
+                auto_deploy=auto,
+                auto_rebind=True
             )
             action = "creada"
 
-    ok(f"Configuración {action}: {args.report} → {args.workspace_dest}  (rebind={model_name}, auto={auto})")
+    entorno = f" [{profile_name}]" if profile_name else ""
+    ok(f"Configuración {action}: {args.report} → {args.workspace_dest}{entorno}  (rebind={model_name}, auto={auto})")
 
 
 def cmd_list_configs(args):
@@ -786,6 +850,294 @@ def cmd_setup_env(args):
        f"{len(result.get('reports', []))} informes")
 
 
+def cmd_env_create(args):
+    header(f"Configurar entorno '{args.alias}'")
+    client, metadata = get_client()
+    deploy_cfg = DeploymentConfigManager(metadata.database)
+
+    step(f"Resolviendo workspace '{args.workspace}'...")
+    ws = client.get_workspace_by_name(args.workspace)
+    ws_id = ws['id'] if ws else ''
+    if not ws:
+        warn("Workspace no encontrado — guardando solo el nombre")
+
+    with Spinner("Guardando entorno"):
+        result = deploy_cfg.configure_environment(
+            profile_name=args.alias,
+            target_workspace_name=args.workspace,
+            target_workspace_id=ws_id,
+            stage_order=getattr(args, "stage_order", None),
+            environment_type=getattr(args, "type", None) or "development",
+            description=getattr(args, "description", None)
+        )
+
+    orden = f" (stage_order={result['stage_order']})" if result['stage_order'] is not None else ""
+    ok(f"Entorno {result['action']}: {args.alias} → {args.workspace}{orden}")
+
+
+def cmd_env_list(_args):
+    header("Entornos configurados")
+    _, metadata = get_client()
+    deploy_cfg = DeploymentConfigManager(metadata.database)
+
+    with Spinner("Consultando entornos"):
+        environments = deploy_cfg.list_environments()
+
+    if not environments:
+        warn("No hay entornos configurados aún. Usa env-create.")
+        return
+
+    print()
+    chain = " → ".join(
+        f"{e['profile_name']} ({e['stage_order']})" if e.get('stage_order') is not None else f"{e['profile_name']} (sin orden)"
+        for e in environments
+    )
+    ok(chain)
+    print()
+    lines = []
+    for e in environments:
+        lines.append(f"  {c(e['profile_name'], BOLD)}  →  {e.get('target_workspace_name', '?')}")
+    stream_lines(lines)
+
+
+def cmd_project_create(args):
+    header(f"Crear proyecto '{args.name}'")
+    _, metadata = get_client()
+    pm = ProjectManager(metadata.database, DeploymentConfigManager(metadata.database), metadata, None, None, None)
+
+    with Spinner("Creando proyecto"):
+        result = pm.create_project(args.name, getattr(args, "description", None))
+
+    ok(f"Proyecto creado: {result['project_name']} (ID: {result['id']})")
+
+
+def cmd_project_add_artifact(args):
+    header(f"Añadir artefacto a proyecto '{args.project}'")
+    _, metadata = get_client()
+    pm = ProjectManager(metadata.database, DeploymentConfigManager(metadata.database), metadata, None, None, None)
+
+    artifact_type = "model" if args.type == "model" else "report"
+    with Spinner("Guardando artefacto"):
+        result = pm.add_project_artifact(
+            project_name=args.project,
+            artifact_type=artifact_type,
+            artifact_name=args.artifact,
+            rebind_to_artifact_name=getattr(args, "rebind", None),
+            sequence_order=getattr(args, "order", None),
+            notes=getattr(args, "notes", None),
+            folder_path=getattr(args, "folder", None)
+        )
+
+    rebind = f"  (rebind → {result['rebind_to_artifact_name']})" if result.get('rebind_to_artifact_name') else ""
+    folder = f"  [carpeta: {result['folder_path']}]" if result.get('folder_path') else ""
+    ok(f"Añadido: {result['artifact_type']}/{result['artifact_name']} a '{args.project}'{rebind}{folder}")
+
+
+def cmd_project_remove_artifact(args):
+    header(f"Quitar artefacto de proyecto '{args.project}'")
+    _, metadata = get_client()
+    pm = ProjectManager(metadata.database, DeploymentConfigManager(metadata.database), metadata, None, None, None)
+
+    artifact_type = "model" if args.type == "model" else "report"
+    with Spinner("Quitando artefacto"):
+        removed = pm.remove_project_artifact(args.project, artifact_type, args.artifact)
+
+    if removed:
+        ok(f"Quitado: {args.artifact} de '{args.project}'")
+    else:
+        warn(f"No estaba en el proyecto: {args.artifact}")
+
+
+def cmd_project_show(args):
+    header(f"Proyecto '{args.name}'")
+    _, metadata = get_client()
+    pm = ProjectManager(metadata.database, DeploymentConfigManager(metadata.database), metadata, None, None, None)
+
+    with Spinner("Consultando proyecto"):
+        project = pm.get_project(args.name)
+
+    ok(f"{project['project_name']}  ({len(project['artifacts'])} artefacto(s))")
+    print()
+    lines = []
+    for a in project['artifacts']:
+        rebind = f"  → rebind: {a['rebind_to_artifact_name']}" if a.get('rebind_to_artifact_name') else ""
+        folder = f"  carpeta: {a['folder_path']}" if a.get('folder_path') else ""
+        lines.append(f"  [{c(a['artifact_type'], CYAN)}] {c(a['artifact_name'], BOLD)}{rebind}{folder}")
+    stream_lines(lines)
+
+
+def cmd_project_list(_args):
+    header("Proyectos")
+    _, metadata = get_client()
+    pm = ProjectManager(metadata.database, DeploymentConfigManager(metadata.database), metadata, None, None, None)
+
+    with Spinner("Consultando proyectos"):
+        projects = pm.list_projects()
+
+    ok(f"{len(projects)} proyecto(s)")
+    print()
+    lines = [f"  {c(p['project_name'], BOLD)}" + (f"  — {p['description']}" if p.get('description') else "")
+             for p in projects]
+    stream_lines(lines)
+
+
+def cmd_project_structure(args):
+    header(f"Estructura de despliegue: proyecto '{args.name}'")
+    _, metadata = get_client()
+    pm = ProjectManager(metadata.database, DeploymentConfigManager(metadata.database), metadata, None, None, None)
+
+    with Spinner("Consultando estructura"):
+        structure = pm.get_deployment_structure(args.name)
+
+    if structure.get('description'):
+        print(f"  {c(structure['description'], DIM)}")
+    print()
+
+    if not structure['environments']:
+        warn("No hay entornos configurados aún. Usa env-create.")
+        return
+
+    for env in structure['environments']:
+        orden = f" (stage_order={env['stage_order']})" if env.get('stage_order') is not None else ""
+        print(c(f"  {env['profile_name']}{orden} → {env.get('target_workspace_name', '?')}", BOLD))
+        lines = []
+        for a in env['artifacts']:
+            folder = a['target_folder_path'] or "(raíz del workspace)"
+            state = a.get('current_state')
+            if state:
+                origen = f" desde {state['promoted_from']}" if state.get('promoted_from') else ""
+                estado = f"ya desplegado — {state.get('last_operation')}{origen} ({state.get('updated_at')})"
+            else:
+                estado = "sin desplegar todavía"
+            lines.append(
+                f"    [{c(a['artifact_type'], CYAN)}] {a['artifact_name']}  →  {folder}  —  {estado}"
+            )
+        stream_lines(lines, delay=0.02)
+        print()
+
+
+def cmd_project_set_workspace(args):
+    header(f"Configurar workspace de '{args.project}' para el entorno '{args.environment}'")
+    client, metadata = get_client()
+    pm = _build_project_manager(client, metadata)
+
+    with Spinner(f"Resolviendo/creando workspace '{args.workspace}'"):
+        result = asyncio.run(pm.configure_project_workspace(
+            args.project, args.environment, args.workspace,
+            artifact_type=getattr(args, "type", None), capacity_id=getattr(args, "capacity_id", None)
+        ))
+
+    accion = "creado" if result['created'] else "reutilizado"
+    ok(f"Workspace {accion}: {result['workspace_name']}  [{result['artifact_type']}]  "
+       f"para '{args.project}' en '{args.environment}'")
+
+
+def cmd_project_provision_workspaces(args):
+    header(f"Aprovisionando workspaces (modo automático): proyecto '{args.project}'")
+    client, metadata = get_client()
+    pm = _build_project_manager(client, metadata)
+
+    with Spinner("Creando entornos y workspaces"):
+        result = asyncio.run(pm.auto_provision_project_workspaces(
+            args.project, capacity_id=getattr(args, "capacity_id", None)
+        ))
+
+    if result['environments_created']:
+        ok(f"Entornos creados: {', '.join(result['environments_created'])}")
+    print()
+    lines = []
+    for w in result['workspaces']:
+        accion = "creado" if w['created'] else "reutilizado"
+        lines.append(f"  [{w['environment']}] {w['artifact_type']}: {w['workspace_name']}  ({accion})")
+    stream_lines(lines)
+
+
+def cmd_capacities(_args):
+    header("Capacidades de Fabric")
+    client, _ = get_client()
+
+    with Spinner("Consultando capacidades"):
+        capacities = client.list_capacities()
+
+    ok(f"{len(capacities)} capacidad(es)")
+    print()
+    lines = [
+        f"  {c(cap.get('displayName', '?'), BOLD)}  {c(cap.get('id', ''), DIM)}  "
+        f"sku={cap.get('sku', '?')}  estado={cap.get('state', '?')}"
+        for cap in capacities
+    ]
+    stream_lines(lines)
+
+
+def cmd_project_tree(args):
+    header("Árbol de despliegue")
+    _, metadata = get_client()
+    pm = ProjectManager(metadata.database, DeploymentConfigManager(metadata.database), metadata, None, None, None)
+
+    with Spinner("Construyendo árbol"):
+        tree = pm.render_deployment_tree(getattr(args, "project", None))
+
+    print()
+    print(tree)
+
+
+def _build_project_manager(client, metadata) -> ProjectManager:
+    deploy_cfg = DeploymentConfigManager(metadata.database)
+    sm_ops = SemanticModelOperations(client, metadata)
+    rep_ops = ReportOperations(client, metadata)
+    return ProjectManager(metadata.database, deploy_cfg, metadata, client, sm_ops, rep_ops)
+
+
+def cmd_deploy(args):
+    header(f"Deploy explícito: proyecto '{args.project}' → entorno '{args.environment}'")
+    warn("Esto sube directamente desde tu carpeta local, saltándose la cadena de promoción. "
+         "Úsalo solo para casos de emergencia/hotfix; para el flujo normal usa 'promote'.")
+    client, metadata = get_client()
+    pm = _build_project_manager(client, metadata)
+
+    source = clean_path(args.source_dir)
+    respect_local_structure = getattr(args, "respect_local_structure", False)
+    if respect_local_structure:
+        step("Respetando estructura de carpetas local")
+
+    with Spinner(f"Desplegando {args.project}"):
+        result = asyncio.run(pm.deploy_project(
+            args.project, args.environment, source, respect_local_structure=respect_local_structure
+        ))
+
+    ok(f"Modelos desplegados: {len(result.get('semantic_models', []))}")
+    ok(f"Informes desplegados: {len(result.get('reports', []))}")
+
+
+def cmd_promote(args):
+    header(f"Promote: proyecto '{args.project}' → entorno '{args.environment}'")
+    client, metadata = get_client()
+    pm = _build_project_manager(client, metadata)
+
+    with Spinner(f"Comprobando divergencia (drift)"):
+        result = asyncio.run(pm.promote_project(args.project, args.environment, confirm_drift=False))
+
+    if result.get('needs_confirmation'):
+        warn(f"Divergencia detectada respecto al entorno origen ({result.get('source_environment', '?')}):")
+        for d in result.get('drift', []):
+            print(f"    [{d['artifact_type']}] {d['artifact_name']}:")
+            for reason in d['reasons']:
+                print(f"      - {reason}")
+        proceed = getattr(args, "yes", False) or confirm("¿Confirmas la sobrescritura?")
+        if not proceed:
+            warn("Promoción cancelada.")
+            return
+        with Spinner(f"Promocionando {args.project} (confirmado)"):
+            result = asyncio.run(pm.promote_project(args.project, args.environment, confirm_drift=True))
+
+    if not result.get('success'):
+        err(f"No se pudo promocionar: {result.get('message', result)}")
+        sys.exit(1)
+
+    ok(f"Promocionado desde '{result.get('source_environment')}' a '{result.get('target_environment')}'")
+    ok(f"Modelos: {len(result.get('semantic_models', []))}  Informes: {len(result.get('reports', []))}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Parser principal
 # ─────────────────────────────────────────────────────────────────────────────
@@ -835,6 +1187,7 @@ def build_parser() -> argparse.ArgumentParser:
     pum.add_argument("workspace")
     pum.add_argument("path", help="Ruta origen (.pbix o carpeta PBIP)")
     pum.add_argument("--name", help="Nombre en el servicio")
+    pum.add_argument("--folder", help="Ruta de carpeta dentro del workspace, ej. 'Ventas/Modelos' (se crea si no existe)")
 
     # download-report
     pdr = sub.add_parser("download-report", help="Descargar informe")
@@ -849,6 +1202,7 @@ def build_parser() -> argparse.ArgumentParser:
     pur.add_argument("--name", help="Nombre en el servicio")
     pur.add_argument("--rebind", help="Modelo semántico al que reenlazar")
     pur.add_argument("--rebind-workspace", help="Workspace donde buscar el modelo de --rebind (si es distinto al de destino)")
+    pur.add_argument("--folder", help="Ruta de carpeta dentro del workspace, ej. 'Ventas/Informes' (se crea si no existe)")
 
     # rebind-report
     prr = sub.add_parser("rebind-report", help="Reenlazar un informe ya publicado a otro modelo semántico")
@@ -871,6 +1225,7 @@ def build_parser() -> argparse.ArgumentParser:
     pcm.add_argument("model")
     pcm.add_argument("workspace_dest", metavar="workspace_destino")
     pcm.add_argument("--auto", action="store_true", help="Auto-deploy activado")
+    pcm.add_argument("--profile", help="Entorno al que aplica esta configuración (alias de env-create)")
 
     # config-report
     pcr = sub.add_parser("config-report", help="Configurar despliegue de informe")
@@ -878,6 +1233,7 @@ def build_parser() -> argparse.ArgumentParser:
     pcr.add_argument("workspace_dest", metavar="workspace_destino")
     pcr.add_argument("--model", help="Modelo semántico para rebind")
     pcr.add_argument("--auto", action="store_true")
+    pcr.add_argument("--profile", help="Entorno al que aplica esta configuración (alias de env-create)")
 
     # list-configs
     plc = sub.add_parser("list-configs", help="Listar configuraciones de despliegue")
@@ -888,6 +1244,83 @@ def build_parser() -> argparse.ArgumentParser:
     pse.add_argument("workspace")
     pse.add_argument("--models", help="Modelos separados por coma: 'M1,M2'")
     pse.add_argument("--reports", help="Mapeo informe=modelo separados por coma: 'R1=M1,R2=M2'")
+
+    # env-create
+    pec = sub.add_parser("env-create", help="Crear/actualizar un entorno (alias + posición en la cadena de promoción)")
+    pec.add_argument("alias", help="Nombre del entorno (ej: Desarrollo, Integración, Producción)")
+    pec.add_argument("workspace", help="Workspace de Fabric asociado")
+    pec.add_argument("--stage-order", type=int, dest="stage_order", help="Posición en la cadena de promoción (0,1,2...)")
+    pec.add_argument("--type", help="Etiqueta de tipo de entorno (ej: development, production)")
+    pec.add_argument("--description", help="Descripción opcional")
+
+    # env-list
+    sub.add_parser("env-list", help="Listar entornos ordenados por su posición en la cadena de promoción")
+
+    # project-create
+    ppc = sub.add_parser("project-create", help="Crear un proyecto (agrupación de modelos + informes)")
+    ppc.add_argument("name")
+    ppc.add_argument("--description", help="Descripción opcional")
+
+    # project-add-artifact
+    ppa = sub.add_parser("project-add-artifact", help="Añadir un modelo o informe a un proyecto")
+    ppa.add_argument("project")
+    ppa.add_argument("type", choices=["model", "report"])
+    ppa.add_argument("artifact", help="Nombre del artefacto")
+    ppa.add_argument("--rebind", help="Solo para report: nombre del modelo del proyecto al que reenlazar")
+    ppa.add_argument("--order", type=int, help="Orden opcional dentro de su tipo")
+    ppa.add_argument("--notes", help="Notas opcionales")
+    ppa.add_argument("--folder", help="Ruta de carpeta dentro del workspace de destino, ej. 'Ventas/Modelos' (se crea si no existe)")
+
+    # project-remove-artifact
+    ppr = sub.add_parser("project-remove-artifact", help="Quitar un modelo o informe de un proyecto")
+    ppr.add_argument("project")
+    ppr.add_argument("type", choices=["model", "report"])
+    ppr.add_argument("artifact")
+
+    # project-show
+    pps = sub.add_parser("project-show", help="Mostrar un proyecto y sus artefactos")
+    pps.add_argument("name")
+
+    # project-list
+    sub.add_parser("project-list", help="Listar todos los proyectos")
+
+    # project-structure
+    pst = sub.add_parser("project-structure", help="Mostrar la estructura completa de despliegue de un proyecto (artefactos, carpetas, entornos, estado)")
+    pst.add_argument("name")
+
+    # project-set-workspace
+    ppw = sub.add_parser("project-set-workspace", help="Modo manual: asigna (y crea si hace falta) el workspace de un proyecto para un entorno")
+    ppw.add_argument("project")
+    ppw.add_argument("environment")
+    ppw.add_argument("workspace", help="Nombre del workspace a usar/crear")
+    ppw.add_argument("--type", choices=["model", "report"], help="Limitar a modelos o a reports (si se omite, workspace combinado)")
+    ppw.add_argument("--capacity-id", dest="capacity_id", help="ID de capacidad de Fabric a asignar si se crea el workspace (ver 'capacities')")
+
+    # project-provision-workspaces
+    ppp2 = sub.add_parser("project-provision-workspaces", help="Modo automático: crea entornos dev/acc/prod y workspaces separados de modelos/reports para un proyecto")
+    ppp2.add_argument("project")
+    ppp2.add_argument("--capacity-id", dest="capacity_id", help="ID de capacidad de Fabric a asignar a los workspaces creados")
+
+    # capacities
+    sub.add_parser("capacities", help="Listar capacidades de Fabric disponibles")
+
+    # project-tree
+    ptr = sub.add_parser("project-tree", help="Árbol de despliegue (proyectos/entornos/carpetas/artefactos)")
+    ptr.add_argument("project", nargs="?", help="Nombre del proyecto (opcional; si se omite, muestra todos)")
+
+    # deploy
+    pdp = sub.add_parser("deploy", help="Deploy explícito: sube un proyecto desde una carpeta local a un entorno (hotfix/emergencia)")
+    pdp.add_argument("project")
+    pdp.add_argument("environment")
+    pdp.add_argument("source_dir", help="Carpeta base con las subcarpetas .SemanticModel/.Report de cada artefacto")
+    pdp.add_argument("--respect-local-structure", action="store_true", dest="respect_local_structure",
+                      help="Replica la jerarquía de subcarpetas locales como carpetas en el workspace destino")
+
+    # promote
+    ppp = sub.add_parser("promote", help="Flujo por defecto: promociona un proyecto desde el entorno anterior de la cadena")
+    ppp.add_argument("project")
+    ppp.add_argument("environment")
+    ppp.add_argument("--yes", action="store_true", help="Confirma automáticamente si hay divergencia (drift)")
 
     return p
 
@@ -910,6 +1343,20 @@ COMMANDS = {
     "config-report":  cmd_config_report,
     "list-configs":   cmd_list_configs,
     "setup-env":      cmd_setup_env,
+    "env-create":             cmd_env_create,
+    "env-list":               cmd_env_list,
+    "project-create":         cmd_project_create,
+    "project-add-artifact":   cmd_project_add_artifact,
+    "project-remove-artifact": cmd_project_remove_artifact,
+    "project-show":           cmd_project_show,
+    "project-list":           cmd_project_list,
+    "project-structure":      cmd_project_structure,
+    "project-set-workspace":  cmd_project_set_workspace,
+    "project-provision-workspaces": cmd_project_provision_workspaces,
+    "capacities":             cmd_capacities,
+    "project-tree":           cmd_project_tree,
+    "deploy":                 cmd_deploy,
+    "promote":                cmd_promote,
 }
 
 

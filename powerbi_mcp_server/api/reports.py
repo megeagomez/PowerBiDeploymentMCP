@@ -154,7 +154,8 @@ class ReportOperations:
         report_name: Optional[str] = None,
         semantic_model_id: Optional[str] = None,
         semantic_model_workspace_id: Optional[str] = None,
-        user_email: Optional[str] = None
+        user_email: Optional[str] = None,
+        folder_path: Optional[str] = None
     ) -> Dict:
         """
         Upload report in PBIR format (Power BI Report)
@@ -165,6 +166,8 @@ class ReportOperations:
                 can live in a different workspace than the report.
             semantic_model_workspace_id: Workspace where the rebind model lives
                 (defaults to the report's workspace; used for metadata tracking)
+            folder_path: Optional '/'-separated folder path within the workspace
+                to place the report in (created automatically if missing).
 
         Returns:
             Dict with upload result including asset ID
@@ -215,8 +218,12 @@ class ReportOperations:
             'parts': parts
         }
 
+        folder_id = self.client.resolve_or_create_folder_path(workspace_id, folder_path)
+
         # Upsert: update if exists, create if not
-        item, created = self.client.upsert_item(workspace_id, 'Report', report_name, definition)
+        item, created = self.client.upsert_item(
+            workspace_id, 'Report', report_name, definition, folder_id=folder_id
+        )
         report_id = item.get('id')
         
         # Record metadata

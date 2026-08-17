@@ -130,26 +130,38 @@ class SemanticModelOperations:
         workspace_name: str,
         file_path: Path,
         dataset_name: Optional[str] = None,
-        user_email: Optional[str] = None
+        user_email: Optional[str] = None,
+        folder_path: Optional[str] = None
     ) -> Dict:
         """
         Upload semantic model in PBIX format
-        
+
+        Args:
+            folder_path: Optional '/'-separated folder path within the workspace
+                to place the dataset in (created if missing). The legacy PBIX
+                import API has no folder support, so this is applied as a
+                follow-up move_item call after import.
+
         Returns:
             Dict with upload result including asset ID
         """
         if not file_path.exists():
             raise FileNotFoundError(f"PBIX file not found: {file_path}")
-        
+
         if dataset_name is None:
             dataset_name = file_path.stem
-        
+
         logger.info(f"Uploading PBIX: {dataset_name} to workspace {workspace_name}")
-        
+
         # Upload via API
         result = self.client.import_pbix(workspace_id, str(file_path), dataset_name)
         dataset_id = result.get('id')
-        
+
+        if folder_path and dataset_id:
+            folder_id = self.client.resolve_or_create_folder_path(workspace_id, folder_path)
+            if folder_id:
+                self.client.move_item(workspace_id, dataset_id, folder_id)
+
         # Record metadata
         upload_id = self.metadata.record_upload(
             artifact_name=dataset_name,
@@ -187,11 +199,16 @@ class SemanticModelOperations:
         workspace_name: str,
         directory_path: Path,
         dataset_name: Optional[str] = None,
-        user_email: Optional[str] = None
+        user_email: Optional[str] = None,
+        folder_path: Optional[str] = None
     ) -> Dict:
         """
         Upload semantic model in PBIP format (Power BI Project)
-        
+
+        Args:
+            folder_path: Optional '/'-separated folder path within the workspace
+                to place the model in (created automatically if missing).
+
         Returns:
             Dict with upload result including asset ID
         """
@@ -228,8 +245,12 @@ class SemanticModelOperations:
             'parts': parts
         }
 
+        folder_id = self.client.resolve_or_create_folder_path(workspace_id, folder_path)
+
         # Upsert: update if exists, create if not
-        item, created = self.client.upsert_item(workspace_id, 'SemanticModel', dataset_name, definition)
+        item, created = self.client.upsert_item(
+            workspace_id, 'SemanticModel', dataset_name, definition, folder_id=folder_id
+        )
         dataset_id = item.get('id')
         
         # Record metadata

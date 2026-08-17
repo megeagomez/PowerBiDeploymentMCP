@@ -18,6 +18,7 @@ from powerbi_mcp_server.auth import get_authenticator
 from powerbi_mcp_server.auth.authenticator import AuthenticationRequired
 from powerbi_mcp_server.metadata import MetadataManager
 from powerbi_mcp_server.metadata.deployment_config import DeploymentConfigManager
+from powerbi_mcp_server.metadata.project_manager import ProjectManager
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class ToolHandlers:
         self._client: Optional[PowerBIClient] = None
         self._semantic_models: Optional[SemanticModelOperations] = None
         self._reports: Optional[ReportOperations] = None
+        self._project_manager: Optional[ProjectManager] = None
     
     async def authenticate(self, arguments: Dict[str, Any]) -> Dict:
         """Start Device Flow authentication and return the login URL/code to the user."""
@@ -49,6 +51,10 @@ class ToolHandlers:
             self._client = PowerBIClient(auth.get_token)
             self._semantic_models = SemanticModelOperations(self._client, self.metadata)
             self._reports = ReportOperations(self._client, self.metadata)
+            self._project_manager = ProjectManager(
+                self.metadata.database, self.deploy_config, self.metadata,
+                self._client, self._semantic_models, self._reports
+            )
 
         return self._client
 
@@ -208,30 +214,32 @@ class ToolHandlers:
         workspace_name = arguments['workspace_name']
         source_path = Path(arguments['source_path'])
         dataset_name = arguments.get('dataset_name')
-        
+        folder_path = arguments.get('folder_path')
+
         # Find workspace
         workspace = self._client.get_workspace_by_name(workspace_name)
         if not workspace:
             raise ValueError(f"Workspace no encontrado: {workspace_name}")
-        
+
         workspace_id = workspace['id']
-        
+
         # Detect format
         format = self._semantic_models.detect_format(source_path)
         if format is None:
             raise ValueError(f"No se pudo detectar el formato del modelo semántico: {source_path}")
-        
+
         # Upload
         auth = get_authenticator()
         user_info = auth.get_user_info() or {}
-        
+
         if format == 'pbix':
             result = await self._semantic_models.upload_pbix(
                 workspace_id=workspace_id,
                 workspace_name=workspace_name,
                 file_path=source_path,
                 dataset_name=dataset_name,
-                user_email=user_info.get('user_email')
+                user_email=user_info.get('user_email'),
+                folder_path=folder_path
             )
         else:  # pbip
             result = await self._semantic_models.upload_pbip(
@@ -239,9 +247,10 @@ class ToolHandlers:
                 workspace_name=workspace_name,
                 directory_path=source_path,
                 dataset_name=dataset_name,
-                user_email=user_info.get('user_email')
+                user_email=user_info.get('user_email'),
+                folder_path=folder_path
             )
-        
+
         return result
     
     async def download_report(self, arguments: Dict[str, Any]) -> Dict:
@@ -291,6 +300,7 @@ class ToolHandlers:
         report_name = arguments.get('report_name')
         rebind_to_model = arguments.get('rebind_to_model')
         rebind_workspace_name = arguments.get('rebind_workspace_name')
+        folder_path = arguments.get('folder_path')
 
         # Find workspace
         workspace = self._client.get_workspace_by_name(workspace_name)
@@ -335,7 +345,8 @@ class ToolHandlers:
             report_name=report_name,
             semantic_model_id=semantic_model_id,
             semantic_model_workspace_id=model_workspace_id,
-            user_email=user_info.get('user_email')
+            user_email=user_info.get('user_email'),
+            folder_path=folder_path
         )
 
         return result
@@ -539,7 +550,9 @@ class ToolHandlers:
         target_workspace_id = arguments.get('target_workspace_id')
         auto_deploy = arguments.get('auto_deploy', False)
         notes = arguments.get('notes')
-        
+        profile_name = arguments.get('profile_name')
+        profile_id = self.deploy_config.resolve_profile_id(profile_name)
+
         # Resolve workspace if ID not provided
         if not target_workspace_id:
             workspace = client.get_workspace_by_name(target_workspace_name)
@@ -548,9 +561,9 @@ class ToolHandlers:
             else:
                 logger.warning(f"Workspace {target_workspace_name} not found, saving name only")
                 target_workspace_id = ''
-        
-        # Check if config already exists
-        existing_config = self.deploy_config.db.get_semantic_model_config(model_name)
+
+        # Check if config already exists (scoped to the environment, if given)
+        existing_config = self.deploy_config.db.get_semantic_model_config(model_name, profile_id=profile_id)
 
         if existing_config:
             # Update existing
@@ -559,7 +572,8 @@ class ToolHandlers:
                 target_workspace_id=target_workspace_id,
                 target_workspace_name=target_workspace_name,
                 auto_deploy=auto_deploy,
-                notes=notes
+                notes=notes,
+                profile_id=profile_id
             )
             logger.info(f"Updated semantic model config: {model_name}")
             action = 'updated'
@@ -569,6 +583,7 @@ class ToolHandlers:
                 model_name=model_name,
                 target_workspace_id=target_workspace_id,
                 target_workspace_name=target_workspace_name,
+                profile_id=profile_id,
                 auto_deploy=auto_deploy,
                 notes=notes
             )
@@ -596,7 +611,9 @@ class ToolHandlers:
         auto_deploy = arguments.get('auto_deploy', False)
         auto_rebind = arguments.get('auto_rebind', True)
         notes = arguments.get('notes')
-        
+        profile_name = arguments.get('profile_name')
+        profile_id = self.deploy_config.resolve_profile_id(profile_name)
+
         # Resolve workspace if ID not provided
         if not target_workspace_id:
             workspace = client.get_workspace_by_name(target_workspace_name)
@@ -625,8 +642,8 @@ class ToolHandlers:
                 else:
                     logger.warning(f"Semantic model {target_model_name} not found in workspace")
         
-        # Check if config already exists
-        existing_config = self.deploy_config.db.get_report_config(report_name)
+        # Check if config already exists (scoped to the environment, if given)
+        existing_config = self.deploy_config.db.get_report_config(report_name, profile_id=profile_id)
 
         if existing_config:
             # Update existing
@@ -638,7 +655,8 @@ class ToolHandlers:
                 target_model_workspace_name=target_model_workspace_name,
                 auto_deploy=auto_deploy,
                 auto_rebind=auto_rebind,
-                notes=notes
+                notes=notes,
+                profile_id=profile_id
             )
             logger.info(f"Updated report config: {report_name}")
             action = 'updated'
@@ -652,6 +670,7 @@ class ToolHandlers:
                 target_semantic_model_name=target_model_name,
                 target_model_workspace_id=target_model_workspace_id,
                 target_model_workspace_name=target_model_workspace_name,
+                profile_id=profile_id,
                 auto_deploy=auto_deploy,
                 auto_rebind=auto_rebind,
                 notes=notes
@@ -674,11 +693,12 @@ class ToolHandlers:
         """Get deployment configuration for an artifact"""
         artifact_name = arguments['artifact_name']
         artifact_type = arguments['artifact_type']
-        
+        profile_name = arguments.get('profile_name')
+
         if artifact_type == 'SemanticModel':
-            config = self.deploy_config.get_deployment_config_for_model(artifact_name)
+            config = self.deploy_config.get_deployment_config_for_model(artifact_name, profile_name=profile_name)
         elif artifact_type == 'Report':
-            config = self.deploy_config.get_deployment_config_for_report(artifact_name)
+            config = self.deploy_config.get_deployment_config_for_report(artifact_name, profile_name=profile_name)
         else:
             raise ValueError(f"Tipo de artefacto no válido: {artifact_type}")
         
@@ -763,3 +783,151 @@ class ToolHandlers:
                       f'  - {len(result["semantic_models"])} modelos semánticos\n'
                       f'  - {len(result["reports"])} informes'
         }
+
+    # ========== Environment hierarchy ==========
+
+    async def configure_environment(self, arguments: Dict[str, Any]) -> Dict:
+        """Create or update a deployment environment (alias + stage_order)"""
+        client = await self._ensure_authenticated()
+
+        profile_name = arguments['profile_name']
+        target_workspace_name = arguments['target_workspace_name']
+        target_workspace_id = arguments.get('target_workspace_id')
+        stage_order = arguments.get('stage_order')
+        environment_type = arguments.get('environment_type', 'development')
+        description = arguments.get('description')
+
+        if not target_workspace_id:
+            workspace = client.get_workspace_by_name(target_workspace_name)
+            if workspace:
+                target_workspace_id = workspace['id']
+            else:
+                logger.warning(f"Workspace {target_workspace_name} not found, saving name only")
+                target_workspace_id = ''
+
+        result = self.deploy_config.configure_environment(
+            profile_name=profile_name,
+            target_workspace_name=target_workspace_name,
+            target_workspace_id=target_workspace_id,
+            stage_order=stage_order,
+            environment_type=environment_type,
+            description=description
+        )
+        return {'success': True, **result}
+
+    async def list_environments(self, arguments: Dict[str, Any]) -> Dict:
+        """List deployment environments ordered by stage_order"""
+        environments = self.deploy_config.list_environments()
+        return {'success': True, 'environments': environments}
+
+    # ========== Projects ==========
+
+    async def create_project(self, arguments: Dict[str, Any]) -> Dict:
+        await self._ensure_authenticated()
+        result = self._project_manager.create_project(
+            project_name=arguments['project_name'],
+            description=arguments.get('description')
+        )
+        return {'success': True, **result}
+
+    async def get_project(self, arguments: Dict[str, Any]) -> Dict:
+        await self._ensure_authenticated()
+        project = self._project_manager.get_project(arguments['project_name'])
+        return {'success': True, 'project': project}
+
+    async def list_projects(self, arguments: Dict[str, Any]) -> Dict:
+        await self._ensure_authenticated()
+        projects = self._project_manager.list_projects()
+        return {'success': True, 'projects': projects}
+
+    async def add_project_artifact(self, arguments: Dict[str, Any]) -> Dict:
+        await self._ensure_authenticated()
+        result = self._project_manager.add_project_artifact(
+            project_name=arguments['project_name'],
+            artifact_type=arguments['artifact_type'],
+            artifact_name=arguments['artifact_name'],
+            rebind_to_artifact_name=arguments.get('rebind_to_artifact_name'),
+            sequence_order=arguments.get('sequence_order'),
+            notes=arguments.get('notes'),
+            folder_path=arguments.get('folder_path')
+        )
+        return {'success': True, **result}
+
+    async def remove_project_artifact(self, arguments: Dict[str, Any]) -> Dict:
+        await self._ensure_authenticated()
+        removed = self._project_manager.remove_project_artifact(
+            project_name=arguments['project_name'],
+            artifact_type=arguments['artifact_type'],
+            artifact_name=arguments['artifact_name']
+        )
+        return {'success': True, 'removed': removed}
+
+    async def deploy_project(self, arguments: Dict[str, Any]) -> Dict:
+        """Explicit path: push a project from a local folder into any environment
+        (hotfix/emergency path — bypasses the promotion chain, no drift check)."""
+        await self._ensure_authenticated()
+        user_info = get_authenticator().get_user_info() or {}
+        result = await self._project_manager.deploy_project(
+            project_name=arguments['project_name'],
+            environment=arguments['environment'],
+            source_dir=Path(arguments['source_dir']),
+            user_email=user_info.get('user_email'),
+            respect_local_structure=arguments.get('respect_local_structure', False)
+        )
+        return result
+
+    async def promote_project(self, arguments: Dict[str, Any]) -> Dict:
+        """Default path: move a project from the predecessor environment (by
+        stage_order) into the target environment, in-memory, with drift check."""
+        await self._ensure_authenticated()
+        user_info = get_authenticator().get_user_info() or {}
+        result = await self._project_manager.promote_project(
+            project_name=arguments['project_name'],
+            environment=arguments['environment'],
+            confirm_drift=arguments.get('confirm_drift', False),
+            user_email=user_info.get('user_email')
+        )
+        return result
+
+    async def get_project_deployment_structure(self, arguments: Dict[str, Any]) -> Dict:
+        """Read-only: artifacts, configured target folders, and known deployment
+        state per environment for a project."""
+        await self._ensure_authenticated()
+        structure = self._project_manager.get_deployment_structure(arguments['project_name'])
+        return {'success': True, 'structure': structure}
+
+    async def list_fabric_capacities(self, arguments: Dict[str, Any]) -> Dict:
+        client = await self._ensure_authenticated()
+        capacities = client.list_capacities()
+        return {'success': True, 'capacities': capacities}
+
+    async def configure_project_workspace(self, arguments: Dict[str, Any]) -> Dict:
+        """Manual mode: register (creating if missing) the workspace a project
+        uses for one environment, optionally scoped to one artifact type."""
+        await self._ensure_authenticated()
+        result = await self._project_manager.configure_project_workspace(
+            project_name=arguments['project_name'],
+            environment=arguments['environment'],
+            workspace_name=arguments['workspace_name'],
+            artifact_type=arguments.get('artifact_type'),
+            capacity_id=arguments.get('capacity_id')
+        )
+        return {'success': True, **result}
+
+    async def auto_provision_project_workspaces(self, arguments: Dict[str, Any]) -> Dict:
+        """Automatic mode: ensures dev/acc/prod environments exist and creates/
+        registers one workspace per environment per artifact type, following
+        the '{project}_{semantic|reports}{_dev|_acc|}' naming convention."""
+        await self._ensure_authenticated()
+        result = await self._project_manager.auto_provision_project_workspaces(
+            project_name=arguments['project_name'],
+            capacity_id=arguments.get('capacity_id')
+        )
+        return result
+
+    async def get_deployment_tree(self, arguments: Dict[str, Any]) -> Dict:
+        """Read-only ASCII tree of project(s) -> environments -> simulated
+        folders -> artifacts, with resolved workspace and last deploy date."""
+        await self._ensure_authenticated()
+        tree = self._project_manager.render_deployment_tree(arguments.get('project_name'))
+        return {'success': True, 'tree': tree}

@@ -126,7 +126,89 @@ class PowerBIClient:
         except Exception as e:
             self._handle_error(e, f"Get workspace by name: {workspace_name}")
             raise
-    
+
+    def create_workspace(
+        self, workspace_name: str, description: Optional[str] = None, capacity_id: Optional[str] = None
+    ) -> Dict:
+        """
+        Create a new Power BI workspace. If a workspace with that exact name
+        already exists, reuses it instead of failing (mirrors the
+        already-proven behaviour in powerbi_object_manager.py's
+        create_workspace/create_folder).
+
+        Args:
+            capacity_id: Optional Fabric capacity ID to assign the workspace to.
+                If omitted, the workspace is created without a capacity
+                (still valid on many tenants; can be assigned later).
+
+        Returns:
+            Workspace dict with at least 'id' and 'name'.
+        """
+        url = f"{self.POWERBI_BASE_URL}/groups"
+        payload = {'name': workspace_name}
+
+        try:
+            self._log_request('POST', url, json=payload)
+            response = request_with_retry('POST', url, headers=self.headers, json=payload)
+            workspace = response.json()
+            logger.info(f"Created workspace: {workspace_name} (ID: {workspace.get('id')})")
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code in (400, 409) and self._is_duplicate_workspace_error(e.response):
+                existing = self.get_workspace_by_name(workspace_name)
+                if existing:
+                    logger.info(f"Workspace already exists, reusing: {workspace_name} (ID: {existing.get('id')})")
+                    return existing
+            self._handle_error(e, f"Create workspace: {workspace_name}")
+            raise
+        except Exception as e:
+            self._handle_error(e, f"Create workspace: {workspace_name}")
+            raise
+
+        if description:
+            # Best-effort: workspace description isn't settable at creation time
+            # via this endpoint; not critical enough to fail workspace creation over.
+            pass
+
+        if capacity_id:
+            self._assign_workspace_to_capacity(workspace['id'], capacity_id)
+
+        return workspace
+
+    def _assign_workspace_to_capacity(self, workspace_id: str, capacity_id: str) -> None:
+        url = f"{self.POWERBI_BASE_URL}/groups/{workspace_id}/AssignToCapacity"
+        payload = {'capacityId': capacity_id}
+        try:
+            self._log_request('POST', url, json=payload)
+            request_with_retry('POST', url, headers=self.headers, json=payload)
+            logger.info(f"Assigned workspace {workspace_id} to capacity {capacity_id}")
+        except Exception as e:
+            self._handle_error(e, f"Assign workspace to capacity: {workspace_id}")
+            raise
+
+    @staticmethod
+    def _is_duplicate_workspace_error(response: requests.Response) -> bool:
+        if response.status_code == 409:
+            return True
+        try:
+            body = response.json()
+            code = body.get('error', {}).get('code', '') or body.get('errorCode', '')
+            return 'AlreadyExists' in code or 'AlreadyInUse' in code
+        except Exception:
+            return False
+
+    def list_capacities(self) -> List[Dict]:
+        """List Fabric capacities available to the user (id, displayName, sku, region, state)."""
+        url = f"{self.FABRIC_BASE_URL}/capacities"
+        try:
+            self._log_request('GET', url)
+            response = request_with_retry('GET', url, headers=self.headers)
+            capacities = response.json().get('value', [])
+            logger.info(f"Retrieved {len(capacities)} capacities")
+            return capacities
+        except Exception as e:
+            self._handle_error(e, "List capacities")
+            raise
+
     def list_workspace_items(
         self,
         workspace_id: str,
@@ -316,7 +398,10 @@ class PowerBIClient:
             self._handle_error(e, f"Import PBIX: {dataset_name}")
             raise
     
-    def create_item(self, workspace_id: str, item_type: str, display_name: str, definition: Dict) -> Dict:
+    def create_item(
+        self, workspace_id: str, item_type: str, display_name: str, definition: Dict,
+        folder_id: Optional[str] = None
+    ) -> Dict:
         """
         Create a new Fabric item with definition via POST /items.
         Handles LRO (202 Accepted) automatically.
@@ -328,6 +413,8 @@ class PowerBIClient:
             'type': item_type,
             'definition': definition,
         }
+        if folder_id:
+            payload['folderId'] = folder_id
 
         try:
             self._log_request('POST', url, json=payload)
@@ -372,10 +459,16 @@ class PowerBIClient:
             raise
 
     def upsert_item(
-        self, workspace_id: str, item_type: str, display_name: str, definition: Dict
+        self, workspace_id: str, item_type: str, display_name: str, definition: Dict,
+        folder_id: Optional[str] = None
     ) -> tuple:
         """
         Create or update a Fabric item by display name.
+
+        If folder_id is given: a newly created item is placed there directly;
+        an item that already existed gets relocated there via move_item (so a
+        re-upload after changing the configured folder actually moves it,
+        instead of leaving it wherever it was created originally).
 
         Returns:
             (item_dict, created: bool) — created=True if new, False if updated in-place
@@ -385,9 +478,118 @@ class PowerBIClient:
 
         if existing:
             self.update_item_definition(workspace_id, existing['id'], definition)
+            if folder_id:
+                self.move_item(workspace_id, existing['id'], folder_id)
             logger.info(f"Upserted (updated) {item_type}: {display_name}")
             return existing, False
         else:
-            item = self.create_item(workspace_id, item_type, display_name, definition)
+            item = self.create_item(workspace_id, item_type, display_name, definition, folder_id=folder_id)
             logger.info(f"Upserted (created) {item_type}: {display_name}")
             return item, True
+
+    # Folder operations
+
+    def list_folders(self, workspace_id: str) -> List[Dict]:
+        """
+        List all folders in a workspace (paginated via continuationUri, same
+        pattern as list_workspace_items).
+        """
+        url = f"{self.FABRIC_BASE_URL}/workspaces/{workspace_id}/folders"
+        folders = []
+        try:
+            while url:
+                self._log_request('GET', url)
+                response = request_with_retry('GET', url, headers=self.headers)
+                data = response.json()
+                folders.extend(data.get('value', []))
+                url = data.get('continuationUri')
+
+            logger.info(f"Retrieved {len(folders)} folders from workspace {workspace_id}")
+            return folders
+        except Exception as e:
+            self._handle_error(e, f"List folders: {workspace_id}")
+            raise
+
+    def create_folder(
+        self, workspace_id: str, display_name: str, parent_folder_id: Optional[str] = None
+    ) -> Dict:
+        """
+        Create a folder in a workspace. If a folder with that name already
+        exists under the same parent (API returns 409), reuse it instead of
+        failing — mirrors the behaviour already proven in
+        powerbi_object_manager.py's create_folder/_find_folder_by_name.
+        """
+        url = f"{self.FABRIC_BASE_URL}/workspaces/{workspace_id}/folders"
+        payload = {'displayName': display_name}
+        if parent_folder_id:
+            payload['parentFolderId'] = parent_folder_id
+
+        try:
+            self._log_request('POST', url, json=payload)
+            response = request_with_retry('POST', url, headers=self.headers, json=payload)
+            folder = response.json()
+            logger.info(f"Created folder: {display_name} (ID: {folder.get('id')})")
+            return folder
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 409:
+                existing = next(
+                    (
+                        f for f in self.list_folders(workspace_id)
+                        if f.get('displayName') == display_name and f.get('parentFolderId') == parent_folder_id
+                    ),
+                    None
+                )
+                if existing:
+                    logger.info(f"Folder already exists, reusing: {display_name} (ID: {existing.get('id')})")
+                    return existing
+            self._handle_error(e, f"Create folder: {display_name}")
+            raise
+        except Exception as e:
+            self._handle_error(e, f"Create folder: {display_name}")
+            raise
+
+    def resolve_or_create_folder_path(self, workspace_id: str, folder_path: Optional[str]) -> Optional[str]:
+        """
+        Resolve a '/'-separated folder path to the leaf folder's ID, creating
+        any missing segment along the way. Returns None (no API calls) if
+        folder_path is empty/None.
+        """
+        if not folder_path:
+            return None
+
+        segments = [s.strip() for s in folder_path.split('/') if s.strip()]
+        if not segments:
+            return None
+
+        existing_folders = self.list_folders(workspace_id)
+        parent_id = None
+        for segment in segments:
+            match = next(
+                (
+                    f for f in existing_folders
+                    if f.get('displayName') == segment and f.get('parentFolderId') == parent_id
+                ),
+                None
+            )
+            if match:
+                parent_id = match['id']
+                continue
+
+            folder = self.create_folder(workspace_id, segment, parent_folder_id=parent_id)
+            parent_id = folder['id']
+            existing_folders.append(folder)
+
+        return parent_id
+
+    def move_item(self, workspace_id: str, item_id: str, folder_id: Optional[str]) -> None:
+        """Move an existing item to a different folder (or to the workspace root if folder_id is None)."""
+        url = f"{self.FABRIC_BASE_URL}/workspaces/{workspace_id}/items/{item_id}/move"
+        payload = {'targetFolderId': folder_id}
+
+        try:
+            self._log_request('POST', url, json=payload)
+            request_with_retry('POST', url, headers=self.headers, json=payload)
+            logger.info(f"Moved item {item_id} to folder {folder_id}")
+        except Exception as e:
+            self._handle_error(e, f"Move item: {item_id}")
+            raise
