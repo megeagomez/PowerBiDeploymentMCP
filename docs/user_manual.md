@@ -159,6 +159,12 @@ El servidor usa **Device Flow** (flujo de dispositivo) de Microsoft, el mismo me
 
 Los tokens se renuevan automáticamente. Solo necesitarás repetir el proceso si cierras sesión manualmente o si el token se corrompe.
 
+Si tu máquina ya tiene una sesión activa de Azure CLI (`az login`), el servidor la reutiliza
+automáticamente como paso intermedio, antes de pedir un login interactivo — no requiere
+configuración adicional. Esto aplica tanto al CLI (`pbi_cli.py`) como al servidor MCP lanzado
+por Claude Desktop o VS Code/Copilot, ya que ambos heredan la sesión de usuario de Windows en la
+que ya hiciste `az login`.
+
 > **Nota para administradores**: La autenticación puede cambiarse de Device Flow a **App Registration (Service Principal)** para despliegues no interactivos o para que usuarios de negocio desplieguen sin tener permisos directos en el workspace de destino. Esto requiere una modificación menor en el código de autenticación (`powerbi_mcp_server/auth/`).
 
 ---

@@ -5,6 +5,8 @@ Handles Device Flow authentication and token management for Power BI and OneLake
 """
 
 import asyncio
+import base64
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -12,7 +14,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import msal
-from azure.identity import ClientSecretCredential
+from azure.identity import AzureCliCredential, ClientSecretCredential, CredentialUnavailableError
 
 from .token_manager import encrypt_data, decrypt_data
 
@@ -130,4 +132,50 @@ def service_principal_authenticate(tenant_id: str, client_id: str, client_secret
         "powerbi": result["access_token"],
         "onelake_credential": credential,
         "expires_at": expires_at,
+    }
+
+
+def _decode_jwt_claims(access_token: str) -> Dict:
+    """
+    Best-effort decode of a JWT's payload claims, for display only (no signature
+    verification — we never use this for trust decisions, only to show who's
+    signed in). Returns {} if the token isn't decodable.
+    """
+    try:
+        payload_b64 = access_token.split(".")[1]
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded))
+    except Exception as e:
+        logger.debug(f"Could not decode JWT claims for display: {e}")
+        return {}
+
+
+def azure_cli_authenticate() -> Optional[Dict]:
+    """
+    Best-effort reuse of an existing `az login` session via AzureCliCredential.
+
+    Returns None (never raises) when no az session is available, so callers can
+    silently fall through to the next auth step. Unexpected errors from the
+    underlying subprocess call still propagate — only "no az session" is treated
+    as a normal, silent miss.
+    """
+    try:
+        credential = AzureCliCredential()
+        token = credential.get_token(*POWERBI_SCOPE)
+    except CredentialUnavailableError as e:
+        logger.debug(f"Azure CLI credential unavailable, skipping: {e}")
+        return None
+
+    claims = _decode_jwt_claims(token.token)
+    user_name = claims.get("name", "Usuario (az login)")
+    user_email = claims.get("upn") or claims.get("unique_name") or claims.get("preferred_username", "")
+    expires_at = datetime.fromtimestamp(token.expires_on)
+
+    return {
+        "powerbi": token.token,
+        "user_name": user_name,
+        "user_email": user_email,
+        "expires_at": expires_at,
+        "auth_method": "az_cli",
+        "principal": f"user:{user_email}" if user_email else "user:az_cli",
     }

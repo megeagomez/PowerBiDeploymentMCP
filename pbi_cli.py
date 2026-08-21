@@ -57,7 +57,7 @@ logging.disable(logging.CRITICAL)
 
 # ── módulos del servidor ─────────────────────────────────────────────────────
 from powerbi_mcp_server.auth.device_flow import (
-    try_silent_auth, initiate_device_flow, complete_device_flow_sync
+    try_silent_auth, initiate_device_flow, complete_device_flow_sync, azure_cli_authenticate
 )
 from powerbi_mcp_server.auth.token_manager import AuthenticationStateManager
 from powerbi_mcp_server.api.client import PowerBIClient
@@ -190,7 +190,19 @@ def get_token() -> str:
     except Exception:
         pass
 
-    # 3. Device Flow interactivo
+    # 3. Sesión az login existente
+    step("Sin renovación silenciosa disponible, probando sesión Azure CLI (az login)...")
+    with Spinner("Comprobando az login"):
+        try:
+            result = azure_cli_authenticate()
+        except Exception:
+            result = None
+    if result:
+        state.update_state(result)
+        ok(f"Sesión Azure CLI reutilizada: {result['user_name']} <{result['user_email']}>")
+        return result["powerbi"]
+
+    # 4. Device Flow interactivo
     step("Iniciando Device Flow...")
     app, flow, message = initiate_device_flow()
 

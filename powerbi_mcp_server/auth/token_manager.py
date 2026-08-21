@@ -84,6 +84,8 @@ class AuthenticationStateManager:
             "powerbi_token": auth_result.get("powerbi"),
             "user_name": auth_result.get("user_name"),
             "user_email": auth_result.get("user_email"),
+            "auth_method": auth_result.get("auth_method", "device_flow"),
+            "principal": auth_result.get("principal"),
             "expires_at": auth_result.get("expires_at").isoformat() if isinstance(auth_result.get("expires_at"), datetime) else auth_result.get("expires_at"),
             "saved_at": datetime.now().isoformat()
         }
@@ -210,7 +212,8 @@ class AuthenticationStateManager:
         if self._current_state:
             return {
                 "user_name": self._current_state.get("user_name"),
-                "user_email": self._current_state.get("user_email")
+                "user_email": self._current_state.get("user_email"),
+                "auth_method": self._current_state.get("auth_method")
             }
         
         return None

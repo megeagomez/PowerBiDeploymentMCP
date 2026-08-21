@@ -12,6 +12,7 @@ from .device_flow import (
     initiate_device_flow,
     complete_device_flow_sync,
     try_silent_auth,
+    azure_cli_authenticate,
     AuthenticationError,
     _executor,
 )
@@ -75,7 +76,17 @@ class PowerBIAuthenticator:
         except Exception as e:
             logger.warning(f"Silent auth failed: {e}")
 
-        # 3. No token available — caller must show Device Flow to the user
+        # 3. Try reusing an existing `az login` session (best-effort, silent)
+        try:
+            result = azure_cli_authenticate()
+            if result:
+                self.state_manager.update_state(result)
+                logger.info(f"Azure CLI auth succeeded for {result.get('user_email')}")
+                return result["powerbi"]
+        except Exception as e:
+            logger.warning(f"Azure CLI auth failed: {e}")
+
+        # 4. No token available — caller must show Device Flow to the user
         raise AuthenticationRequired(
             "No hay sesión activa. Llama a la herramienta `authenticate` para iniciar el login con Microsoft."
         )
@@ -100,6 +111,17 @@ class PowerBIAuthenticator:
                 self.state_manager.update_state(result)
                 return (
                     f"✓ Autenticado silenciosamente como {result['user_name']} ({result['user_email']})"
+                )
+        except Exception:
+            pass
+
+        # Try reusing an existing `az login` session next
+        try:
+            result = azure_cli_authenticate()
+            if result:
+                self.state_manager.update_state(result)
+                return (
+                    f"✓ Autenticado vía sesión Azure CLI como {result['user_name']} ({result['user_email']})"
                 )
         except Exception:
             pass

@@ -46,6 +46,32 @@ Ensure outbound HTTPS connections to `login.microsoftonline.com` are allowed.
 Test-NetConnection login.microsoftonline.com -Port 443
 ```
 
+### Azure CLI Session Not Being Reused
+
+**Symptoms:**
+- `az login` shows an active session in a terminal, but the server or `pbi_cli.py` still
+  prompts a Device Flow login instead of reusing it.
+
+**Solutions:**
+
+1. **Verify `az` is on PATH for the process that will use it:**
+   ```powershell
+   where.exe az
+   ```
+
+2. **Claude Desktop / VS Code Copilot users — stale PATH:** the MCP server runs as a child
+   process of Claude Desktop (or VS Code), inheriting whatever PATH that app captured at its
+   own last launch. If you installed Azure CLI *after* starting Claude Desktop or VS Code, the
+   child process won't see `az.exe`/`az.cmd` until you fully restart the app — reloading the
+   window or opening a new chat is not enough.
+
+3. **Confirm the az session itself is valid:**
+   ```powershell
+   az account get-access-token --resource https://analysis.windows.net/powerbi/api
+   ```
+   If this fails outside the MCP server too, the session has expired or was never established
+   — run `az login` again.
+
 ## Rate Limiting
 
 ### HTTP 429 Errors
