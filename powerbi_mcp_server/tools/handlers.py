@@ -35,10 +35,37 @@ class ToolHandlers:
         self._project_manager: Optional[ProjectManager] = None
     
     async def authenticate(self, arguments: Dict[str, Any]) -> Dict:
-        """Start Device Flow authentication and return the login URL/code to the user."""
+        """
+        Start authentication. `method` picks how: 'auto' (default) tries
+        cache -> az-cli -> Device Flow in order; 'device_flow' forces a
+        fresh interactive login regardless of any cached/az-cli session;
+        'az_cli' forces reuse of the current az login session only.
+        """
+        method = arguments.get("method", "auto")
         auth = get_authenticator()
-        message = await auth.start_device_flow()
+
+        if method == "auto":
+            message = await auth.start_device_flow()
+        elif method == "device_flow":
+            message = await auth.start_device_flow(force=True)
+        elif method == "az_cli":
+            message = await auth.authenticate_with_az_cli()
+        else:
+            return {
+                "success": False,
+                "error": f"Método de autenticación desconocido: '{method}'. Usa 'auto', 'device_flow' o 'az_cli'."
+            }
+
         return {"success": True, "message": message}
+
+    async def logout(self, arguments: Dict[str, Any]) -> Dict:
+        """Clear the locally cached token so the next call requires re-authentication."""
+        auth = get_authenticator()
+        auth.logout()
+        return {
+            "success": True,
+            "message": "Sesión cerrada. La próxima operación pedirá autenticarte de nuevo."
+        }
 
     async def _ensure_authenticated(self) -> PowerBIClient:
         """Return authenticated client or raise AuthenticationRequired."""

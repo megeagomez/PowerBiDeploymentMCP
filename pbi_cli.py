@@ -57,7 +57,8 @@ logging.disable(logging.CRITICAL)
 
 # ── módulos del servidor ─────────────────────────────────────────────────────
 from powerbi_mcp_server.auth.device_flow import (
-    try_silent_auth, initiate_device_flow, complete_device_flow_sync, azure_cli_authenticate
+    try_silent_auth, initiate_device_flow, complete_device_flow_sync, azure_cli_authenticate,
+    AuthenticationError
 )
 from powerbi_mcp_server.auth.token_manager import AuthenticationStateManager
 from powerbi_mcp_server.api.client import PowerBIClient
@@ -168,8 +169,57 @@ class Spinner:
 # Autenticación CLI (interactiva — bloquea hasta completar)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_token() -> str:
+def _run_device_flow_interactive(state: AuthenticationStateManager) -> str:
+    """Blocking Device Flow: prints the code/URL box, polls, caches the result."""
+    app, flow, message = initiate_device_flow()
+
+    print()
+    print(c("  ┌─────────────────────────────────────────────────────────┐", YELLOW))
+    for line in message.strip().splitlines():
+        print(c(f"  │  {line:<55} │", YELLOW))
+    print(c("  └─────────────────────────────────────────────────────────┘", YELLOW))
+    print()
+
+    with Spinner("Esperando autenticación en el navegador"):
+        result = complete_device_flow_sync(app, flow)
+
+    state.update_state(result)
+    ok(f"Autenticado: {result['user_name']} <{result['user_email']}>")
+    return result["powerbi"]
+
+
+def get_token(method: str = "auto") -> str:
+    """
+    method='auto' (default): caché -> renovación silenciosa -> az login -> Device Flow.
+    method='device_flow': fuerza un login interactivo nuevo, sin probar atajos —
+        para entrar con la cuenta de otro cliente/tenant sin esperar a que caduque
+        la sesión actual.
+    method='az_cli': fuerza recoger la sesión de Azure CLI activa ahora mismo,
+        sin caer a Device Flow si no hay ninguna.
+    """
     state = AuthenticationStateManager()
+
+    if method == "device_flow":
+        step("Forzando Device Flow interactivo...")
+        return _run_device_flow_interactive(state)
+
+    if method == "az_cli":
+        step("Forzando autenticación vía sesión Azure CLI (az login)...")
+        with Spinner("Comprobando az login"):
+            try:
+                result = azure_cli_authenticate()
+            except Exception:
+                result = None
+        if not result:
+            raise AuthenticationError(
+                "No se encontró una sesión de Azure CLI (az login) activa o utilizable."
+            )
+        state.update_state(result)
+        ok(f"Sesión Azure CLI reutilizada: {result['user_name']} <{result['user_email']}>")
+        return result["powerbi"]
+
+    if method != "auto":
+        raise ValueError(f"Método de autenticación desconocido: '{method}'. Usa 'auto', 'device_flow' o 'az_cli'.")
 
     # 1. DPAPI cache
     with Spinner("Buscando sesión guardada"):
@@ -203,22 +253,13 @@ def get_token() -> str:
         return result["powerbi"]
 
     # 4. Device Flow interactivo
-    step("Iniciando Device Flow...")
-    app, flow, message = initiate_device_flow()
+    return _run_device_flow_interactive(state)
 
-    print()
-    print(c("  ┌─────────────────────────────────────────────────────────┐", YELLOW))
-    for line in message.strip().splitlines():
-        print(c(f"  │  {line:<55} │", YELLOW))
-    print(c("  └─────────────────────────────────────────────────────────┘", YELLOW))
-    print()
 
-    with Spinner("Esperando autenticación en el navegador"):
-        result = complete_device_flow_sync(app, flow)
-
-    state.update_state(result)
-    ok(f"Autenticado: {result['user_name']} <{result['user_email']}>")
-    return result["powerbi"]
+def logout() -> None:
+    state = AuthenticationStateManager()
+    state.clear_tokens()
+    ok("Sesión cerrada. La próxima operación pedirá autenticarte de nuevo.")
 
 
 def get_client() -> tuple[PowerBIClient, MetadataManager]:
@@ -233,9 +274,14 @@ def get_client() -> tuple[PowerBIClient, MetadataManager]:
 # Comandos
 # ─────────────────────────────────────────────────────────────────────────────
 
-def cmd_auth(_args):
+def cmd_auth(args):
     header("Autenticación")
-    get_token()
+    get_token(method=args.method)
+
+
+def cmd_logout(_args):
+    header("Cerrar sesión")
+    logout()
 
 
 def cmd_workspaces(args):
@@ -1163,7 +1209,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", metavar="comando")
 
     # auth
-    sub.add_parser("auth", help="Autenticar con Microsoft")
+    pa = sub.add_parser("auth", help="Autenticar con Microsoft")
+    pa.add_argument(
+        "--method", choices=["auto", "device_flow", "az_cli"], default="auto",
+        help="'auto' (por defecto): caché -> az login -> Device Flow. "
+             "'device_flow': fuerza login interactivo nuevo (para entrar con otra cuenta/cliente). "
+             "'az_cli': fuerza recoger la sesión de az login activa ahora mismo."
+    )
+
+    # logout
+    sub.add_parser("logout", help="Cerrar sesión (borra el token cacheado localmente)")
 
     # workspaces
     pw = sub.add_parser("workspaces", help="Listar workspaces")
@@ -1339,6 +1394,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {
     "auth":               cmd_auth,
+    "logout":             cmd_logout,
     "workspaces":         cmd_workspaces,
     "contents":           cmd_contents,
     "models":             cmd_models,

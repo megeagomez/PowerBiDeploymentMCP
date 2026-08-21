@@ -392,9 +392,34 @@ TOOL_SCHEMAS: Dict[str, Dict] = {
     
     "authenticate": {
         "name": "authenticate",
-        "description": "Inicia la autenticación con Microsoft (Device Flow). "
-                      "Devuelve la URL y el código para autenticarte en el navegador. "
-                      "Llama a esta herramienta primero si cualquier otra herramienta falla con error de autenticación.",
+        "description": "Inicia la autenticación con Microsoft. Llama a esta herramienta primero si "
+                      "cualquier otra herramienta falla con error de autenticación. Por defecto "
+                      "('auto') prueba primero la caché, luego una sesión de Azure CLI (az login) "
+                      "activa, y solo si ninguna funciona lanza el Device Flow interactivo. "
+                      "Útil para quien trabaja con varios clientes/tenants: usa 'device_flow' para "
+                      "forzar un login interactivo nuevo (p. ej. para entrar con la cuenta de otro "
+                      "cliente sin esperar a que caduque la sesión actual), o 'az_cli' para forzar "
+                      "que recoja explícitamente la sesión de az login activa ahora mismo "
+                      "(útil tras un 'az login --tenant <otro>').",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "description": "Método de autenticación a usar (por defecto 'auto')",
+                    "enum": ["auto", "device_flow", "az_cli"]
+                }
+            }
+        }
+    },
+
+    "logout": {
+        "name": "logout",
+        "description": "Cierra la sesión actual borrando el token cacheado localmente. La siguiente "
+                      "operación requerirá autenticarte de nuevo (vía 'authenticate'). No cierra tu "
+                      "sesión de Azure CLI (az login) — si esta herramienta seguía recogiendo esa "
+                      "sesión automáticamente, la próxima llamada volverá a autenticar con ella salvo "
+                      "que uses 'authenticate' con method='device_flow' para forzar otra cuenta.",
         "inputSchema": {
             "type": "object",
             "properties": {}

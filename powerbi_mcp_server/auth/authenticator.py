@@ -91,40 +91,47 @@ class PowerBIAuthenticator:
             "No hay sesión activa. Llama a la herramienta `authenticate` para iniciar el login con Microsoft."
         )
 
-    async def start_device_flow(self) -> str:
+    async def start_device_flow(self, force: bool = False) -> str:
         """
         Initiate Device Flow. Returns the user-facing message (URL + code)
         and starts background polling. Non-blocking.
+
+        force=True skips the "already authenticated" / silent / az-cli
+        shortcuts and always launches a fresh interactive login — used when
+        a caller explicitly asks for Device Flow (e.g. someone working with
+        several clients/tenants who needs to log into a *different* account
+        than whatever is cached or currently logged into Azure CLI).
         """
-        # If already authenticated, skip
-        if self.is_authenticated():
-            user_info = self.state_manager.get_user_info() or {}
-            return (
-                f"✓ Ya estás autenticado como {user_info.get('user_name', 'Usuario')} "
-                f"({user_info.get('user_email', '')})"
-            )
-
-        # Try silent auth first
-        try:
-            result = try_silent_auth()
-            if result:
-                self.state_manager.update_state(result)
+        if not force:
+            # If already authenticated, skip
+            if self.is_authenticated():
+                user_info = self.state_manager.get_user_info() or {}
                 return (
-                    f"✓ Autenticado silenciosamente como {result['user_name']} ({result['user_email']})"
+                    f"✓ Ya estás autenticado como {user_info.get('user_name', 'Usuario')} "
+                    f"({user_info.get('user_email', '')})"
                 )
-        except Exception:
-            pass
 
-        # Try reusing an existing `az login` session next
-        try:
-            result = azure_cli_authenticate()
-            if result:
-                self.state_manager.update_state(result)
-                return (
-                    f"✓ Autenticado vía sesión Azure CLI como {result['user_name']} ({result['user_email']})"
-                )
-        except Exception:
-            pass
+            # Try silent auth first
+            try:
+                result = try_silent_auth()
+                if result:
+                    self.state_manager.update_state(result)
+                    return (
+                        f"✓ Autenticado silenciosamente como {result['user_name']} ({result['user_email']})"
+                    )
+            except Exception:
+                pass
+
+            # Try reusing an existing `az login` session next
+            try:
+                result = azure_cli_authenticate()
+                if result:
+                    self.state_manager.update_state(result)
+                    return (
+                        f"✓ Autenticado vía sesión Azure CLI como {result['user_name']} ({result['user_email']})"
+                    )
+            except Exception:
+                pass
 
         # Start device flow
         app, flow, message = initiate_device_flow()
@@ -142,6 +149,22 @@ class PowerBIAuthenticator:
             "⏳ Esperando que completes la autenticación en el navegador...\n"
             "Una vez autenticado, vuelve a llamar a cualquier herramienta de Power BI."
         )
+
+    async def authenticate_with_az_cli(self) -> str:
+        """
+        Force-attempt reuse of an existing `az login` session only — does
+        NOT fall back to Device Flow. Useful to explicitly pick up a
+        different Azure CLI session (e.g. after `az login --tenant <other>`
+        for a different client) without waiting for the cached token to
+        expire or launching an interactive login.
+        """
+        result = azure_cli_authenticate()
+        if not result:
+            raise AuthenticationError(
+                "No se encontró una sesión de Azure CLI (az login) activa o utilizable."
+            )
+        self.state_manager.update_state(result)
+        return f"✓ Autenticado vía sesión Azure CLI como {result['user_name']} ({result['user_email']})"
 
     def _on_auth_complete(self, future):
         """Callback when background polling finishes."""
