@@ -267,8 +267,16 @@ git --version
 
 ### Database Locked
 
+The server automatically retries (with backoff, up to ~8 seconds total) if
+another process briefly holds `metadata.duckdb` open — this covers the
+common case of two server copies starting at nearly the same time (e.g.
+Claude Desktop's normal session plus a separate copy it starts for
+Cowork/Code sessions). The steps below are only needed if the lock outlasts
+that retry window — usually a stuck/zombie process still holding the file.
+
 **Symptoms:**
-- Error: "database is locked"
+- Error: "database is locked" (or `duckdb.IOException` mentioning the file
+  is in use) that persists after a few seconds.
 
 **Solutions:**
 

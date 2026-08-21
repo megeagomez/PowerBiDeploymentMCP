@@ -7,6 +7,7 @@ workspace mappings, and report-to-model relationships.
 
 import logging
 import os
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,15 @@ from typing import Dict, List, Optional
 import duckdb
 
 logger = logging.getLogger(__name__)
+
+# DuckDB allows only one process to hold a given database file open at a
+# time. This package can be launched as more than one independent OS process
+# against the same metadata.duckdb (e.g. a normal chat session plus a
+# separate "Cowork/Code" copy Claude Desktop starts for itself) — if two of
+# them call connect() within the same short startup window, one gets a
+# duckdb.IOException. These retries ride out that race instead of crashing.
+_LOCK_RETRY_ATTEMPTS = 6
+_LOCK_RETRY_BASE_DELAY = 0.25  # seconds, doubles each attempt
 
 
 class MetadataDatabase:
@@ -40,8 +50,28 @@ class MetadataDatabase:
 
     @contextmanager
     def _db(self):
-        """Open a fresh connection, yield it, then close it."""
-        conn = duckdb.connect(str(self.db_path))
+        """
+        Open a fresh connection, yield it, then close it.
+
+        Retries with exponential backoff if another process currently holds
+        the file open (duckdb.IOException) — see module docstring above.
+        """
+        conn = None
+        delay = _LOCK_RETRY_BASE_DELAY
+        for attempt in range(_LOCK_RETRY_ATTEMPTS):
+            try:
+                conn = duckdb.connect(str(self.db_path))
+                break
+            except duckdb.IOException as e:
+                if attempt == _LOCK_RETRY_ATTEMPTS - 1:
+                    raise
+                logger.warning(
+                    f"Metadata database locked by another process "
+                    f"(attempt {attempt + 1}/{_LOCK_RETRY_ATTEMPTS}), "
+                    f"retrying in {delay:.2f}s: {e}"
+                )
+                time.sleep(delay)
+                delay *= 2
         try:
             yield conn
         finally:
